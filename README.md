@@ -8,7 +8,7 @@
 - `.env` : Telegram Bot Token / Chat ID / 실행 설정
 - `.env.example` : 환경변수 샘플
 - `requirements.txt` : 필요한 Python 패키지
-- `data/cache/` : FinanceDataReader OHLCV CSV 캐시
+- `data/cache/` : FinanceDataReader OHLCV CSV 캐시. 종목별 고정 파일(`ohlcv_005930.csv`)에 누적 저장하고, 매일 실행 시 마지막 저장일 이후 구간만 추가 조회합니다.
 - `data/reports/` : 스캔 결과 CSV, 통계 JSON
 - `data/charts/` : 생성된 차트 이미지
 - `logs/` : 실행 로그
@@ -63,7 +63,8 @@ python main.py --workers 2
 ## 리팩토링에서 반영한 필수 개선
 
 - Telegram `BOT_TOKEN`, `CHAT_ID`를 `.env`로 분리
-- `FinanceDataReader.DataReader` 호출에 CSV 캐시 적용
+- `FinanceDataReader.DataReader` 호출에 종목별 고정 CSV 캐시 적용
+- 매일 운영 시 기존 OHLCV 캐시를 재사용하고 마지막 저장일 이후 구간만 incremental refresh
 - 종목별 OHLCV 조회에 재시도/backoff 적용
 - 병렬 수 기본값을 `10`에서 `4`로 낮춰 차단 가능성 완화
 - 1차 필터에서 가격/당일 거래대금 기준으로 OHLCV 조회 대상 축소

@@ -196,41 +196,86 @@ def safe_filename(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", value)
 
 
-def cache_path(symbol: str, start_date: str) -> Path:
-    return CACHE_DIR / f"ohlcv_{safe_filename(symbol)}_{start_date}.csv"
+def cache_path(symbol: str) -> Path:
+    """종목별 고정 OHLCV 캐시 경로.
+
+    날짜를 파일명에 넣지 않아야 매일 실행 시 기존 600일치 데이터를 재사용하고
+    마지막 저장일 이후 구간만 추가 조회할 수 있다.
+    """
+    return CACHE_DIR / f"ohlcv_{safe_filename(symbol)}.csv"
+
+
+def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    normalized = df.copy()
+    normalized.index = pd.to_datetime(normalized.index)
+    normalized = normalized.sort_index()
+    normalized = normalized[~normalized.index.duplicated(keep="last")]
+    return normalized
 
 
 def read_cached_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame | None:
-    path = cache_path(symbol, start_date)
-    if config.force_refresh or not path.exists():
+    if config.force_refresh:
         return None
-    age_hours = (time.time() - path.stat().st_mtime) / 3600
-    if age_hours > config.cache_ttl_hours:
+
+    path = cache_path(symbol)
+    if not path.exists():
         return None
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+
+    df = normalize_ohlcv(pd.read_csv(path, index_col=0, parse_dates=True))
     if df.empty:
         return None
-    return df
+
+    requested_start = pd.Timestamp(start_date)
+    if df.index.min() > requested_start or df.index.max() < requested_start:
+        return None
+
+    return df.loc[df.index >= requested_start]
 
 
-def write_cached_ohlcv(symbol: str, start_date: str, df: pd.DataFrame) -> None:
+def cache_is_fresh(symbol: str, config: Config) -> bool:
+    path = cache_path(symbol)
+    if not path.exists():
+        return False
+    age_hours = (time.time() - path.stat().st_mtime) / 3600
+    return age_hours <= config.cache_ttl_hours
+
+
+def write_cached_ohlcv(symbol: str, df: pd.DataFrame) -> None:
+    df = normalize_ohlcv(df)
     if not df.empty:
-        df.to_csv(cache_path(symbol, start_date), encoding="utf-8-sig")
+        df.to_csv(cache_path(symbol), encoding="utf-8-sig")
+
+
+def merge_ohlcv(cached: pd.DataFrame | None, fetched: pd.DataFrame, start_date: str) -> pd.DataFrame:
+    fetched = normalize_ohlcv(fetched)
+    if cached is not None and not cached.empty:
+        merged = pd.concat([cached, fetched])
+    else:
+        merged = fetched
+    merged = normalize_ohlcv(merged)
+    return merged.loc[merged.index >= pd.Timestamp(start_date)]
 
 
 def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
     cached = read_cached_ohlcv(symbol, start_date, config)
-    if cached is not None:
+    if cached is not None and cache_is_fresh(symbol, config):
         return cached
+
+    fetch_start = start_date
+    if cached is not None and not cached.empty:
+        # 마지막 저장일을 하루 겹쳐 받아서 당일 데이터 수정/보정분은 새 값으로 덮어쓴다.
+        fetch_start = cached.index.max().strftime("%Y-%m-%d")
 
     last_error: Exception | None = None
     for attempt in range(1, config.fetch_retries + 1):
         try:
-            df = fdr.DataReader(symbol, start_date)
-            if df is None or df.empty:
+            fetched = fdr.DataReader(symbol, fetch_start)
+            if fetched is None or fetched.empty:
                 raise ValueError("empty dataframe")
-            df = df.sort_index()
-            write_cached_ohlcv(symbol, start_date, df)
+            df = merge_ohlcv(cached, fetched, start_date)
+            write_cached_ohlcv(symbol, df)
             return df
         except Exception as exc:  # noqa: BLE001 - 종목별 실패를 집계해야 함
             last_error = exc
