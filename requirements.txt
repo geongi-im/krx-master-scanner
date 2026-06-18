@@ -5,3 +5,4 @@ beautifulsoup4>=4.12
 matplotlib>=3.8
 mplfinance>=0.12.10b0
 python-dotenv>=1.0
+pymysql>=1.1
