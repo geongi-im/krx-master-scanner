@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 KRX Master Scanner
 
 기존 Jupyter/Colab 단일 셀 스캐너를 로컬 실행 가능한 Python 스크립트로 정리한 버전.
 - Telegram token/chat_id는 .env에서 읽는다.
-- FinanceDataReader OHLCV 호출은 로컬 CSV 캐시 + 재시도/backoff를 사용한다.
-- 종목별 성공/스킵/실패 카운트와 결과 CSV를 남긴다.
+- FinanceDataReader OHLCV 호출은 MariaDB 캐시 + 재시도/backoff를 사용한다.
+- 종목별 성공/스킵/실패 카운트와 결과를 MariaDB에 남긴다.
 """
 
 from __future__ import annotations
@@ -18,14 +18,13 @@ import platform
 import re
 import time
 import warnings
-import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import FinanceDataReader as fdr
 import matplotlib as mpl
@@ -34,31 +33,41 @@ import matplotlib as mpl
 mpl.use("Agg")
 
 import matplotlib.font_manager as fm
-import matplotlib.pyplot as plt
-import mplfinance as mpf
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+import db_scheme
+from analysis import ScanResult, analyze_stock, build_message, check_market_regime, generate_chart, get_stock_details
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 KST = timezone(timedelta(hours=9))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
-CACHE_DIR = DATA_DIR / "cache"
 CHART_DIR = DATA_DIR / "charts"
-REPORT_DIR = DATA_DIR / "reports"
 LOG_DIR = APP_DIR / "logs"
 ASSET_DIR = APP_DIR / "assets"
+CACHE_START_TOLERANCE_DAYS = 7
+VCP_LOOKBACK_DAYS = 400
+CHART_RETENTION_DAYS = 3
 
-for directory in (DATA_DIR, CACHE_DIR, CHART_DIR, REPORT_DIR, LOG_DIR, ASSET_DIR):
+for directory in (DATA_DIR, CHART_DIR, LOG_DIR, ASSET_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(APP_DIR / ".env")
 
 
 def env_bool(name: str, default: bool) -> bool:
+    """환경변수 문자열을 bool 값으로 변환합니다.
+
+    Args:
+        name: 읽을 환경변수 이름입니다.
+        default: 환경변수가 없을 때 사용할 기본값입니다.
+
+    Returns:
+        환경변수가 참 값 문자열이면 True, 그 외에는 False입니다.
+    """
     value = os.getenv(name)
     if value is None:
         return default
@@ -66,6 +75,15 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def env_int(name: str, default: int) -> int:
+    """환경변수 문자열을 int 값으로 변환합니다.
+
+    Args:
+        name: 읽을 환경변수 이름입니다.
+        default: 환경변수가 없거나 비어 있을 때 사용할 기본값입니다.
+
+    Returns:
+        변환된 정수 값입니다.
+    """
     value = os.getenv(name)
     if not value:
         return default
@@ -73,6 +91,15 @@ def env_int(name: str, default: int) -> int:
 
 
 def env_float(name: str, default: float) -> float:
+    """환경변수 문자열을 float 값으로 변환합니다.
+
+    Args:
+        name: 읽을 환경변수 이름입니다.
+        default: 환경변수가 없거나 비어 있을 때 사용할 기본값입니다.
+
+    Returns:
+        변환된 실수 값입니다.
+    """
     value = os.getenv(name)
     if not value:
         return default
@@ -89,6 +116,13 @@ class Config:
     fetch_retries: int = env_int("FETCH_RETRIES", 3)
     request_timeout: int = env_int("REQUEST_TIMEOUT", 10)
 
+    db_host: str = os.getenv("DB_HOST", "127.0.0.1")
+    db_port: int = env_int("DB_PORT", 3306)
+    db_name: str | None = os.getenv("DB_NAME")
+    db_user: str | None = os.getenv("DB_USER")
+    db_password: str | None = os.getenv("DB_PASSWORD")
+    db_table_prefix: str = os.getenv("DB_TABLE_PREFIX", "kms")
+
     first_pass_min_close: int = env_int("FIRST_PASS_MIN_CLOSE", 500)
     first_pass_min_amount: int = env_int("FIRST_PASS_MIN_AMOUNT", 1_000_000_000)
     min_avg_turnover: int = env_int("MIN_AVG_TURNOVER", 1_000_000_000)
@@ -98,64 +132,35 @@ class Config:
     send_charts: bool = env_bool("SEND_CHARTS", True)
     force_refresh: bool = env_bool("FORCE_REFRESH", False)
 
+    collect_enabled: bool = env_bool("COLLECT_ENABLED", True)
+    collect_days: int = env_int("COLLECT_DAYS", 600)
+
+    vcp_enabled: bool = field(default_factory=lambda: env_bool("VCP_ENABLED", True))
+    vcp_min_avg_traded_value: int = field(default_factory=lambda: env_int("VCP_MIN_AVG_TRADED_VALUE", 15_000_000_000))
+    vcp_max_drop_from_high: float = field(default_factory=lambda: env_float("VCP_MAX_DROP_FROM_HIGH", 0.18))
+    vcp_max_pivot_gap: float = field(default_factory=lambda: env_float("VCP_MAX_PIVOT_GAP", 0.15))
+    vcp_max_contraction_ratio: float = field(default_factory=lambda: env_float("VCP_MAX_CONTRACTION_RATIO", 1.0))
+    vcp_min_pocket_pivot_count: int = field(default_factory=lambda: env_int("VCP_MIN_POCKET_PIVOT_COUNT", 1))
+
     @property
     def telegram_enabled(self) -> bool:
+        """텔레그램 전송 설정이 실제 값으로 채워져 있는지 확인합니다.
+
+        Returns:
+            봇 토큰과 채팅 ID가 모두 유효하면 True입니다.
+        """
         if not self.telegram_bot_token or not self.telegram_chat_id:
             return False
         placeholders = {"YOUR_BOT_TOKEN_HERE", "YOUR_CHAT_ID_HERE", ""}
         return self.telegram_bot_token not in placeholders and self.telegram_chat_id not in placeholders
 
 
-@dataclass
-class MarketRegime:
-    ok: bool
-    is_bull_market: bool
-    current: float
-    ma50: float
-    kq_return_60: float
-    error: str | None = None
-
-
-@dataclass
-class ScanResult:
-    stars: int
-    star_icon: str
-    name: str
-    code: str
-    sector: str
-    curr_p: float
-    breakout_pct: float
-    pole_ratio: float
-    flag_depth: float
-    vol_ratio: float
-    curr_adr: float
-    avg_turnover: float
-    nr3_status: str
-    vcp_status: str
-    kulamegi_htf_status: str
-    fib_summary: str
-    rs_status: str
-    rs_score: float
-    stock_return_60: float
-    entry_p: float
-    target_p: float
-    stop_p: float
-    ref_date: str
-    material_info: str = ""
-    quant_scenario: str = ""
-
-
-@dataclass
-class AnalysisOutcome:
-    status: str  # found | skipped | failed
-    code: str
-    name: str
-    reason: str
-    result: ScanResult | None = None
-    error: str | None = None
-
-
 def setup_logging() -> logging.Logger:
+    """파일과 콘솔에 기록하는 애플리케이션 로거를 설정합니다.
+
+    Returns:
+        KRX 마스터 스캐너에서 사용할 로거입니다.
+    """
     now = datetime.now(KST).strftime("%Y-%m-%d")
     log_file = LOG_DIR / f"{now}.log"
     logging.basicConfig(
@@ -172,7 +177,31 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
+def cleanup_old_chart_images(charts_dir: Path, *, now_ts: float | None = None) -> int:
+    """차트 디렉터리에서 3일이 지난 PNG 이미지를 삭제합니다."""
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    cutoff_ts = (time.time() if now_ts is None else now_ts) - (CHART_RETENTION_DAYS * 24 * 60 * 60)
+    deleted = 0
+
+    for image_path in charts_dir.glob("*.png"):
+        try:
+            if image_path.is_file() and image_path.stat().st_mtime < cutoff_ts:
+                image_path.unlink()
+                deleted += 1
+        except OSError as exc:
+            logger.warning("오래된 차트 이미지 삭제 실패: %s (%s)", image_path, exc)
+
+    if deleted:
+        logger.info("오래된 차트 이미지 삭제: dir=%s deleted=%s retention_days=%s", charts_dir, deleted, CHART_RETENTION_DAYS)
+    return deleted
+
+
 def setup_korean_font() -> None:
+    """차트 이미지에서 한글이 깨지지 않도록 matplotlib 폰트를 설정합니다.
+
+    Raises:
+        requests.HTTPError: Linux 환경에서 한글 폰트 다운로드에 실패한 경우 발생합니다.
+    """
     system = platform.system()
     if system == "Windows":
         mpl.rcParams["font.family"] = "Malgun Gothic"
@@ -193,62 +222,428 @@ def setup_korean_font() -> None:
 
 
 def safe_filename(value: str) -> str:
+    """파일명에 안전하지 않은 문자를 밑줄로 치환합니다.
+
+    Args:
+        value: 파일명으로 사용할 원본 문자열입니다.
+
+    Returns:
+        파일명에 사용할 수 있는 문자만 남긴 문자열입니다.
+    """
     return re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", value)
 
 
-def cache_path(symbol: str) -> Path:
-    """종목별 고정 OHLCV 캐시 경로.
-
-    날짜를 파일명에 넣지 않아야 매일 실행 시 기존 600일치 데이터를 재사용하고
-    마지막 저장일 이후 구간만 추가 조회할 수 있다.
-    """
-    return CACHE_DIR / f"ohlcv_{safe_filename(symbol)}.csv"
-
-
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """OHLCV 데이터프레임의 인덱스와 숫자 컬럼을 분석 가능한 형태로 정리합니다.
+
+    Args:
+        df: 원본 OHLCV 데이터프레임입니다.
+
+    Returns:
+        날짜 인덱스 정렬, 중복 제거, 숫자 변환, 0 이하 OHLC 제거를 마친 데이터프레임입니다.
+    """
     if df.empty:
         return df
     normalized = df.copy()
     normalized.index = pd.to_datetime(normalized.index)
     normalized = normalized.sort_index()
     normalized = normalized[~normalized.index.duplicated(keep="last")]
+    price_columns = ["Open", "High", "Low", "Close"]
+    if all(column in normalized.columns for column in price_columns):
+        numeric_columns = [column for column in [*price_columns, "Volume", "Amount"] if column in normalized.columns]
+        for column in numeric_columns:
+            normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
+        normalized = normalized.dropna(subset=price_columns)
+        normalized = normalized[(normalized[price_columns] > 0).all(axis=1)]
     return normalized
 
 
+def db_table_prefix(config: Config) -> str:
+    """환경설정의 DB 테이블 접두사를 검증하고 정리합니다.
+
+    Args:
+        config: DB 테이블 접두사를 포함한 실행 설정입니다.
+
+    Returns:
+        끝의 밑줄을 제거한 유효한 테이블 접두사입니다.
+
+    Raises:
+        RuntimeError: 접두사가 허용된 식별자 형식이 아닌 경우 발생합니다.
+    """
+    try:
+        return db_scheme.sanitize_table_prefix(config.db_table_prefix)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def db_table_names(config: Config) -> tuple[str, str]:
+    """OHLCV 캐시와 메타 테이블명을 생성합니다.
+
+    Args:
+        config: DB 테이블 접두사를 포함한 실행 설정입니다.
+
+    Returns:
+        OHLCV 테이블명과 캐시 메타 테이블명입니다.
+    """
+    return db_scheme.ohlcv_table_names(db_table_prefix(config))
+
+
+def ensure_ohlcv_cache_tables(connection, config: Config) -> None:
+    """OHLCV 캐시 테이블이 없으면 생성합니다."""
+    db_scheme.ensure_ohlcv_cache_tables(connection, db_table_prefix(config))
+
+
+def db_connection(config: Config):
+    """MariaDB 연결 객체를 생성합니다.
+
+    Args:
+        config: DB 접속정보와 타임아웃 설정입니다.
+
+    Returns:
+        PyMySQL 연결 객체입니다.
+
+    Raises:
+        RuntimeError: 필수 DB 환경변수가 없거나 PyMySQL이 설치되지 않은 경우 발생합니다.
+    """
+    missing = [
+        name
+        for name, value in (
+            ("DB_NAME", config.db_name),
+            ("DB_USER", config.db_user),
+            ("DB_PASSWORD", config.db_password),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"MariaDB 접속 환경변수가 없습니다: {', '.join(missing)}")
+
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("PyMySQL이 필요합니다. `pip install -r requirements.txt`를 실행하세요.") from exc
+
+    return pymysql.connect(
+        host=config.db_host,
+        port=config.db_port,
+        user=config.db_user,
+        password=config.db_password,
+        database=config.db_name,
+        charset="utf8mb4",
+        connect_timeout=config.request_timeout,
+        read_timeout=max(config.request_timeout, 20),
+        write_timeout=max(config.request_timeout, 20),
+        autocommit=False,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def ohlcv_from_db_rows(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """MariaDB OHLCV 조회 결과를 분석용 데이터프레임으로 변환합니다.
+
+    Args:
+        rows: DictCursor로 조회한 OHLCV 행 목록입니다.
+
+    Returns:
+        DateTimeIndex와 표준 OHLCV 컬럼을 가진 데이터프레임입니다.
+    """
+    if not rows:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "Amount", "AmountSource"])
+
+    df = pd.DataFrame(rows)
+    df = df.rename(
+        columns={
+            "trade_date": "Date",
+            "open_price": "Open",
+            "high_price": "High",
+            "low_price": "Low",
+            "close_price": "Close",
+            "volume": "Volume",
+            "amount": "Amount",
+            "amount_source": "AmountSource",
+        }
+    )
+    df.index = pd.to_datetime(df.pop("Date"))
+    return normalize_ohlcv(df)
+
+
+def decimal_value(value: object) -> Decimal:
+    """값을 Decimal로 변환합니다.
+
+    Args:
+        value: Decimal로 변환할 값입니다.
+
+    Returns:
+        문자열 기반으로 변환한 Decimal 값입니다.
+    """
+    return Decimal(str(value))
+
+
+def int_value(value: object) -> int:
+    """값을 정수로 변환합니다.
+
+    Args:
+        value: 정수로 변환할 값입니다.
+
+    Returns:
+        Decimal 경유로 변환한 정수 값입니다.
+    """
+    return int(Decimal(str(value)))
+
+
+def ohlcv_db_params(symbol: str, df: pd.DataFrame) -> list[tuple[object, ...]]:
+    """OHLCV 데이터프레임을 upsert용 파라미터 목록으로 변환합니다.
+
+    Args:
+        symbol: 종목 코드입니다.
+        df: 저장할 OHLCV 데이터프레임입니다.
+
+    Returns:
+        MariaDB executemany에 전달할 튜플 목록입니다.
+    """
+    params: list[tuple[object, ...]] = []
+    for trade_date, row in df.iterrows():
+        open_price = decimal_value(row["Open"])
+        high_price = decimal_value(row["High"])
+        low_price = decimal_value(row["Low"])
+        close_price = decimal_value(row["Close"])
+        volume = int_value(row["Volume"]) if "Volume" in row.index and pd.notna(row["Volume"]) else 0
+
+        if "Amount" in row.index and pd.notna(row["Amount"]):
+            amount = int_value(row["Amount"])
+            amount_source = str(row["AmountSource"]) if "AmountSource" in row.index and pd.notna(row["AmountSource"]) else "source"
+        else:
+            amount = int((close_price * Decimal(volume)).to_integral_value())
+            amount_source = "computed"
+
+        params.append(
+            (
+                symbol,
+                pd.Timestamp(trade_date).date(),
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
+                amount,
+                amount_source,
+            )
+        )
+    return params
+
+
 def read_cached_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame | None:
+    """MariaDB에서 요청 시작일 이후의 OHLCV 캐시를 읽습니다.
+
+    Args:
+        symbol: 조회할 종목 코드입니다.
+        start_date: 필요한 데이터의 시작일입니다.
+        config: DB 접속정보와 캐시 설정입니다.
+
+    Returns:
+        캐시가 유효하면 OHLCV 데이터프레임, 사용할 캐시가 없으면 None입니다.
+    """
     if config.force_refresh:
         return None
 
-    path = cache_path(symbol)
-    if not path.exists():
-        return None
-
-    df = normalize_ohlcv(pd.read_csv(path, index_col=0, parse_dates=True))
-    if df.empty:
-        return None
-
     requested_start = pd.Timestamp(start_date)
-    if df.index.min() > requested_start or df.index.max() < requested_start:
-        return None
+    ohlcv_table, meta_table = db_table_names(config)
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT min_trade_date, max_trade_date
+                FROM {meta_table}
+                WHERE symbol = %s
+                """,
+                (symbol,),
+            )
+            meta = cursor.fetchone()
+            if not meta:
+                return None
 
-    return df.loc[df.index >= requested_start]
+            min_trade_date = meta["min_trade_date"]
+            max_trade_date = meta["max_trade_date"]
+            if not min_trade_date or not max_trade_date:
+                return None
+            if pd.Timestamp(min_trade_date) > requested_start + pd.Timedelta(days=CACHE_START_TOLERANCE_DAYS):
+                return None
+            if pd.Timestamp(max_trade_date) < requested_start:
+                return None
+
+            cursor.execute(
+                f"""
+                SELECT
+                  trade_date,
+                  open_price,
+                  high_price,
+                  low_price,
+                  close_price,
+                  volume,
+                  amount,
+                  amount_source
+                FROM {ohlcv_table}
+                WHERE symbol = %s
+                  AND trade_date >= %s
+                  AND open_price > 0
+                  AND high_price > 0
+                  AND low_price > 0
+                  AND close_price > 0
+                ORDER BY trade_date
+                """,
+                (symbol, requested_start.date()),
+            )
+            df = ohlcv_from_db_rows(list(cursor.fetchall()))
+            if df.empty:
+                return None
+            return df
+    finally:
+        connection.close()
+
+
+def expected_latest_trade_date(now: datetime | None = None) -> date:
+    """현재 시각 기준으로 기대하는 최신 거래일을 계산합니다.
+
+    Args:
+        now: 계산 기준 시각입니다. None이면 현재 KST 시각을 사용합니다.
+
+    Returns:
+        주말과 장중 실행을 고려한 기대 최신 거래일입니다.
+    """
+    current = now or datetime.now(KST)
+    candidate = current.date()
+
+    if current.weekday() >= 5:
+        candidate -= timedelta(days=current.weekday() - 4)
+    elif current.hour < 18:
+        candidate -= timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate -= timedelta(days=1)
+
+    return candidate
 
 
 def cache_is_fresh(symbol: str, config: Config) -> bool:
-    path = cache_path(symbol)
-    if not path.exists():
+    """종목의 MariaDB 캐시가 TTL 안에 갱신되었는지 확인합니다.
+
+    Args:
+        symbol: 확인할 종목 코드입니다.
+        config: 캐시 TTL과 DB 접속정보를 포함한 설정입니다.
+
+    Returns:
+        캐시가 강제 갱신 대상이 아니고 TTL 안에 있으며 기대 최신 거래일까지 포함하면 True입니다.
+    """
+    if config.force_refresh:
         return False
-    age_hours = (time.time() - path.stat().st_mtime) / 3600
-    return age_hours <= config.cache_ttl_hours
+
+    _, meta_table = db_table_names(config)
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT last_cached_at, max_trade_date
+                FROM {meta_table}
+                WHERE symbol = %s
+                """,
+                (symbol,),
+            )
+            row = cursor.fetchone()
+            if not row or not row["last_cached_at"]:
+                return False
+            if not row["max_trade_date"] or row["max_trade_date"] < expected_latest_trade_date():
+                return False
+            last_cached_at = row["last_cached_at"]
+            age_hours = (datetime.now() - last_cached_at).total_seconds() / 3600
+            return age_hours <= config.cache_ttl_hours
+    finally:
+        connection.close()
 
 
-def write_cached_ohlcv(symbol: str, df: pd.DataFrame) -> None:
+def write_cached_ohlcv(symbol: str, df: pd.DataFrame, config: Config | None = None) -> None:
+    """OHLCV 데이터를 MariaDB 캐시 테이블에 upsert합니다.
+
+    Args:
+        symbol: 저장할 종목 코드입니다.
+        df: 저장할 OHLCV 데이터프레임입니다.
+        config: DB 접속정보입니다. None이면 기본 Config를 사용합니다.
+    """
+    config = config or Config()
     df = normalize_ohlcv(df)
-    if not df.empty:
-        df.to_csv(cache_path(symbol), encoding="utf-8-sig")
+    if df.empty:
+        return
+
+    params = ohlcv_db_params(symbol, df)
+    if not params:
+        return
+
+    ohlcv_table, meta_table = db_table_names(config)
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {ohlcv_table} (
+                  symbol, trade_date,
+                  open_price, high_price, low_price, close_price,
+                  volume, amount, amount_source
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  open_price = VALUES(open_price),
+                  high_price = VALUES(high_price),
+                  low_price = VALUES(low_price),
+                  close_price = VALUES(close_price),
+                  volume = VALUES(volume),
+                  amount = VALUES(amount),
+                  amount_source = VALUES(amount_source),
+                  updated_at = CURRENT_TIMESTAMP
+                """,
+                params,
+            )
+            cursor.execute(
+                f"""
+                INSERT INTO {meta_table} (
+                  symbol, min_trade_date, max_trade_date, row_count, last_cached_at
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  min_trade_date = VALUES(min_trade_date),
+                  max_trade_date = VALUES(max_trade_date),
+                  row_count = VALUES(row_count),
+                  last_cached_at = VALUES(last_cached_at),
+                  updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    symbol,
+                    pd.Timestamp(df.index.min()).date(),
+                    pd.Timestamp(df.index.max()).date(),
+                    len(df),
+                    datetime.now(),
+                ),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def merge_ohlcv(cached: pd.DataFrame | None, fetched: pd.DataFrame, start_date: str) -> pd.DataFrame:
+    """캐시 데이터와 새로 조회한 OHLCV 데이터를 병합합니다.
+
+    Args:
+        cached: 기존 MariaDB 캐시 데이터입니다.
+        fetched: FDR에서 새로 조회한 데이터입니다.
+        start_date: 반환 데이터의 최소 시작일입니다.
+
+    Returns:
+        중복 날짜를 정리하고 시작일 이후만 남긴 OHLCV 데이터프레임입니다.
+    """
     fetched = normalize_ohlcv(fetched)
     if cached is not None and not cached.empty:
         merged = pd.concat([cached, fetched])
@@ -259,6 +654,19 @@ def merge_ohlcv(cached: pd.DataFrame | None, fetched: pd.DataFrame, start_date: 
 
 
 def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
+    """MariaDB 캐시를 우선 사용해 종목 OHLCV 데이터를 조회합니다.
+
+    Args:
+        symbol: 조회할 종목 코드입니다.
+        start_date: 필요한 데이터의 시작일입니다.
+        config: 캐시, 재시도, DB 접속 설정입니다.
+
+    Returns:
+        분석에 사용할 OHLCV 데이터프레임입니다.
+
+    Raises:
+        RuntimeError: 캐시도 없고 외부 조회도 모두 실패한 경우 발생합니다.
+    """
     cached = read_cached_ohlcv(symbol, start_date, config)
     if cached is not None and cache_is_fresh(symbol, config):
         return cached
@@ -275,7 +683,7 @@ def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
             if fetched is None or fetched.empty:
                 raise ValueError("empty dataframe")
             df = merge_ohlcv(cached, fetched, start_date)
-            write_cached_ohlcv(symbol, df)
+            write_cached_ohlcv(symbol, df, config)
             return df
         except Exception as exc:  # noqa: BLE001 - 종목별 실패를 집계해야 함
             last_error = exc
@@ -284,10 +692,26 @@ def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
             if attempt < config.fetch_retries:
                 time.sleep(sleep_seconds)
 
+    if cached is not None and not cached.empty and not config.force_refresh:
+        logger.warning("OHLCV 갱신 실패. 기존 DB 캐시 사용: symbol=%s error=%s", symbol, last_error)
+        return cached.loc[cached.index >= pd.Timestamp(start_date)]
+
     raise RuntimeError(f"OHLCV 조회 실패: {symbol}: {last_error}")
 
 
 def telegram_post(url: str, *, data: dict[str, Any], files: dict[str, Any] | None, config: Config) -> None:
+    """Telegram API에 요청을 보내고 rate limit을 재시도합니다.
+
+    Args:
+        url: Telegram API 엔드포인트입니다.
+        data: 요청 form 데이터입니다.
+        files: 업로드할 파일 데이터입니다.
+        config: 요청 타임아웃 설정입니다.
+
+    Raises:
+        RuntimeError: 재시도 후에도 Telegram 전송이 실패한 경우 발생합니다.
+        requests.HTTPError: Telegram API가 오류 상태 코드를 반환한 경우 발생합니다.
+    """
     for attempt in range(1, 4):
         response = requests.post(url, data=data, files=files, timeout=config.request_timeout)
         if response.status_code == 429:
@@ -301,6 +725,15 @@ def telegram_post(url: str, *, data: dict[str, Any], files: dict[str, Any] | Non
 
 
 def split_message(text: str, limit: int = 3900) -> list[str]:
+    """Telegram 메시지 길이 제한에 맞게 본문을 나눕니다.
+
+    Args:
+        text: 전송할 원본 메시지입니다.
+        limit: 한 메시지의 최대 문자 수입니다.
+
+    Returns:
+        길이 제한을 넘지 않는 메시지 조각 목록입니다.
+    """
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -317,6 +750,13 @@ def split_message(text: str, limit: int = 3900) -> list[str]:
 
 
 def send_telegram_msg(text: str, config: Config, *, dry_run: bool = False) -> None:
+    """텍스트 메시지를 Telegram으로 전송합니다.
+
+    Args:
+        text: 전송할 메시지입니다.
+        config: Telegram 토큰과 채팅 ID를 포함한 설정입니다.
+        dry_run: 실제 전송 대신 로그만 남길지 여부입니다.
+    """
     if dry_run or not config.telegram_enabled:
         logger.info("Telegram 메시지 스킵(dry_run=%s enabled=%s): %s", dry_run, config.telegram_enabled, text[:120])
         return
@@ -327,6 +767,13 @@ def send_telegram_msg(text: str, config: Config, *, dry_run: bool = False) -> No
 
 
 def send_telegram_photo(photo_path: Path, config: Config, *, dry_run: bool = False) -> None:
+    """차트 이미지 파일을 Telegram으로 전송합니다.
+
+    Args:
+        photo_path: 전송할 이미지 파일 경로입니다.
+        config: Telegram 토큰과 채팅 ID를 포함한 설정입니다.
+        dry_run: 실제 전송 대신 로그만 남길지 여부입니다.
+    """
     if dry_run or not config.telegram_enabled:
         logger.info("Telegram 사진 스킵(dry_run=%s enabled=%s): %s", dry_run, config.telegram_enabled, photo_path)
         return
@@ -335,23 +782,410 @@ def send_telegram_photo(photo_path: Path, config: Config, *, dry_run: bool = Fal
         telegram_post(url, data={"chat_id": config.telegram_chat_id}, files={"photo": fp}, config=config)
 
 
-def check_market_regime(config: Config) -> MarketRegime:
-    start_date = (datetime.now(KST) - timedelta(days=150)).strftime("%Y-%m-%d")
+def record_float(record: pd.Series, key: str) -> float | None:
+    """Pandas 행에서 숫자 값을 안전하게 꺼냅니다.
+
+    Args:
+        record: 후보 정보가 담긴 Pandas 행입니다.
+        key: 읽을 컬럼 이름입니다.
+
+    Returns:
+        유효한 숫자이면 float 값이고, 값이 없거나 NaN이면 None입니다.
+    """
+    value = record.get(key, None)
+    if value is None or pd.isna(value):
+        return None
     try:
-        df = fetch_ohlcv("KQ11", start_date, config)
-        if len(df) < 60:
-            raise ValueError(f"코스닥 지수 데이터 부족: rows={len(df)}")
-        ma50 = float(df["Close"].rolling(50).mean().iloc[-1])
-        current = float(df["Close"].iloc[-1])
-        kq_return_60 = float((df["Close"].iloc[-1] / df["Close"].iloc[-60] - 1) * 100)
-        return MarketRegime(True, current >= ma50, current, ma50, kq_return_60)
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_vcp_interpretation(record: pd.Series) -> str:
+    """VCP 후보 지표에 따라 다양한 해석 문구를 생성합니다.
+
+    Args:
+        record: VCP 후보 정보가 들어 있는 Pandas 행입니다.
+
+    Returns:
+        텔레그램 메시지에 넣을 해석 문구입니다.
+    """
+    drop_pct = record_float(record, "drop_from_52w_high_pct")
+    pivot_gap_pct = record_float(record, "pivot_gap_pct")
+    avg_traded_value = record_float(record, "avg_traded_value_20") or 0
+    pocket_pivot_count = int(record_float(record, "pocket_pivot_count") or record_float(record, "pocket_pivot_count_14d") or 0)
+    fast_ma_gap = record_float(record, "price_vs_fast_ma_pct")
+    mid_ma_gap = record_float(record, "price_vs_mid_ma_pct")
+    contraction_ratio = record_float(record, "contraction_ratio")
+
+    if contraction_ratio is None:
+        swing_drops = record.get("recent_swing_drops_pct", [])
+        if isinstance(swing_drops, list) and len(swing_drops) >= 2 and swing_drops[-2]:
+            contraction_ratio = float(swing_drops[-1]) / float(swing_drops[-2])
+
+    lines: list[str] = []
+    if drop_pct is not None:
+        if drop_pct <= 8:
+            lines.append("강점: 52주 고점과 매우 가까워 돌파 확인 구간에 있습니다.")
+        elif drop_pct <= 15:
+            lines.append("맥락: 신고가권으로 복귀 중이지만 상단 확인까지는 약간의 거리가 있습니다.")
+        else:
+            lines.append("주의: 52주 고점 이격이 남아 있어 즉시 돌파보다 회복 지속성이 중요합니다.")
+
+    if pivot_gap_pct is not None:
+        if pivot_gap_pct <= 5:
+            lines.append("매매 포인트: 최근 피벗과 가까워 거래량 동반 돌파 여부를 바로 확인할 만합니다.")
+        elif pivot_gap_pct <= 10:
+            lines.append("확인 포인트: 피벗까지 여유가 있어 상단 접근 시 거래량 변화를 봐야 합니다.")
+        else:
+            lines.append("주의: 최근 고점까지 거리가 있어 눌림 후 재수축 여부를 한 번 더 확인해야 합니다.")
+
+    if contraction_ratio is not None:
+        if contraction_ratio <= 0.7:
+            lines.append("수축: 직전보다 변동폭이 크게 줄어 에너지 응축 신호가 비교적 뚜렷합니다.")
+        elif contraction_ratio <= 1.0:
+            lines.append("수축: 변동폭은 줄었지만 강한 압축보다는 완만한 정리 구간에 가깝습니다.")
+        else:
+            lines.append("수축: 허용 기준은 통과했지만 최근 변동폭 감소가 약해 추가 수렴 확인이 필요합니다.")
+
+    if pocket_pivot_count >= 2:
+        lines.append(f"수급: 최근 Pocket Pivot이 {pocket_pivot_count}회라 매수세 유입이 반복된 편입니다.")
+    elif pocket_pivot_count == 1:
+        lines.append("수급: Pocket Pivot이 1회 확인되어 초기 수급 단서로 볼 수 있습니다.")
+    else:
+        lines.append("수급: Pocket Pivot이 부족하므로 돌파 당일 거래량 확인 비중을 높여야 합니다.")
+
+    if avg_traded_value >= 50_000_000_000:
+        lines.append("유동성: 평균 거래대금이 충분해 체결 부담은 상대적으로 낮은 편입니다.")
+    elif avg_traded_value >= 15_000_000_000:
+        lines.append("유동성: 거래대금 기준은 통과했지만 호가와 체결 강도 확인이 필요합니다.")
+
+    if fast_ma_gap is not None and mid_ma_gap is not None:
+        if fast_ma_gap >= 10:
+            lines.append(f"과열 체크: 단기선 대비 +{fast_ma_gap:.1f}%라 돌파 실패 시 흔들림이 커질 수 있습니다.")
+        elif fast_ma_gap >= 0 and mid_ma_gap >= 0:
+            lines.append(f"추세: 단기선 대비 +{fast_ma_gap:.1f}%, 중기선 대비 +{mid_ma_gap:.1f}%로 추세 위에 있습니다.")
+
+    if not lines:
+        lines.append("확인: 차트의 수축 구간, 피벗 상단, 돌파 거래량을 함께 확인하세요.")
+
+    return "\n".join(f"   - {line}" for line in lines[:6])
+
+
+def format_vcp_message(record: pd.Series, *, rank_no: int) -> str:
+    """VCP 후보 한 종목의 텔레그램 메시지를 생성합니다.
+
+    Args:
+        record: VCP 후보 정보가 들어 있는 Pandas 행입니다.
+        rank_no: 텔레그램 메시지에 표시할 후보 순번입니다.
+
+    Returns:
+        텔레그램으로 전송할 VCP 후보 메시지입니다.
+    """
+    swing_drops = record.get("recent_swing_drops_pct", [])
+    if isinstance(swing_drops, list) and swing_drops:
+        swing_text = " → ".join(f"{float(value):.1f}%" for value in swing_drops[-3:])
+    else:
+        swing_text = "-"
+
+    name = str(record.get("name", "")).strip()
+    code = str(record.get("code", "")).strip()
+    current_price = float(record.get("current_price", 0))
+    drop_pct = float(record.get("drop_from_52w_high_pct", 0))
+    avg_traded_value = float(record.get("avg_traded_value_20", 0))
+    pocket_pivot_count = int(record.get("pocket_pivot_count", record.get("pocket_pivot_count_14d", 0)))
+    pivot_gap_pct = record.get("pivot_gap_pct", None)
+    pivot_gap_text = f"{float(pivot_gap_pct):.2f}%" if pivot_gap_pct is not None and pd.notna(pivot_gap_pct) else "-"
+    recent_high_window = int(record.get("recent_high_window", 20) or 20)
+    pocket_pivot_days = int(record.get("pocket_pivot_days", 14) or 14)
+    interpretation = format_vcp_interpretation(record)
+
+    return (
+        f"🔎 [VCP 후보 #{rank_no}] {name}({code})\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 현재가: {current_price:,.0f}원\n"
+        f"📍 52주 고점 대비: -{drop_pct:.2f}% | 단계: {record.get('vcp_stage', '-')}\n"
+        f"🎯 최근 {recent_high_window}일 고점까지: {pivot_gap_text}\n"
+        f"💰 20일 평균 거래대금: {avg_traded_value:,.0f}원\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 [VCP 체크]\n"
+        f"   - 최근 수축폭: {swing_text}\n"
+        f"   - Pocket Pivot({pocket_pivot_days}일): {pocket_pivot_count}회\n"
+        "   - 조건: 고점권 + 수축폭 기준 + 거래대금/Pocket Pivot 통과\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🧭 [해석]\n"
+        f"{interpretation}"
+    )
+
+
+def run_vcp_pipeline(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bool) -> None:
+    """종합분석 이후 VCP 스캔과 텔레그램 전송을 실행합니다.
+
+    Args:
+        config: 실행 환경과 필터 기준을 담은 설정 객체입니다.
+        dry_run: 실제 텔레그램 전송 없이 로그만 남길지 여부입니다.
+        max_symbols: 테스트용으로 제한할 최대 종목 수입니다.
+        no_charts: 차트 이미지 생성과 전송을 생략할지 여부입니다.
+    """
+    if not config.vcp_enabled:
+        logger.info("VCP 스캔 비활성화")
+        return
+
+    from vcp_scan import VcpCriteria, run_vcp_scan
+
+    save_charts = config.send_charts and not no_charts
+    criteria = VcpCriteria(
+        min_avg_traded_value=config.vcp_min_avg_traded_value,
+        max_drop_from_high=config.vcp_max_drop_from_high,
+        max_pivot_gap=config.vcp_max_pivot_gap,
+        max_contraction_ratio=config.vcp_max_contraction_ratio,
+        min_pocket_pivot_count=config.vcp_min_pocket_pivot_count,
+    )
+    logger.info("VCP 스캔 시작")
+
+    try:
+        candidates, vcp_run_id, elapsed_seconds = run_vcp_scan(
+            max_symbols=max_symbols,
+            criteria=criteria,
+            days=VCP_LOOKBACK_DAYS,
+            save_charts=save_charts,
+            charts_dir=CHART_DIR,
+            use_project_cache=True,
+            force_refresh=config.force_refresh,
+        )
+    except Exception as exc:  # noqa: BLE001 - 기존 분석 결과 전송 후 VCP 실패만 별도 알림 처리
+        logger.exception("VCP 스캔 실패")
+        send_telegram_msg(f"⚠️ [VCP 스캔 실패]\n{exc}", config, dry_run=dry_run)
+        return
+
+    logger.info("VCP 스캔 결과 DB 저장: run_id=%s candidates=%s", vcp_run_id, len(candidates))
+
+    if candidates.empty:
+        send_telegram_msg("💡 VCP 조건을 만족하는 종목이 없습니다.", config, dry_run=dry_run)
+        return
+
+    send_limit = min(config.top_send_limit, len(candidates))
+    intro_msg = (
+        f"🔎 [VCP 스캔 결과] 후보 종목: {len(candidates)}개\n"
+        f"⏱ 소요 시간: {elapsed_seconds:.1f}초\n\n"
+        f"👇 상위 {send_limit}개 VCP 차트와 브리핑을 보냅니다."
+    )
+    send_telegram_msg(intro_msg, config, dry_run=dry_run)
+
+    for rank_no, (_, record) in enumerate(candidates.head(send_limit).iterrows(), start=1):
+        chart_path = record.get("chart_path", "")
+        if save_charts and chart_path:
+            photo_path = Path(str(chart_path))
+            if photo_path.exists():
+                send_telegram_photo(photo_path, config, dry_run=dry_run)
+                time.sleep(0.5)
+            else:
+                logger.warning("VCP 차트 파일 없음: %s", photo_path)
+        send_telegram_msg(format_vcp_message(record, rank_no=rank_no), config, dry_run=dry_run)
+        time.sleep(0.5)
+
+
+def load_collection_universe_from_db_cache(config: Config, max_symbols: int | None = None) -> pd.DataFrame:
+    """MariaDB 캐시에서 전체 수집 대상 종목 유니버스를 구성합니다.
+
+    Args:
+        config: DB 접속정보입니다.
+        max_symbols: 테스트용 최대 종목 수입니다.
+
+    Returns:
+        Code, Name, Sector 컬럼을 가진 수집 대상 종목 유니버스입니다.
+    """
+    _, meta_table = db_table_names(config)
+    limit_sql = "LIMIT %s" if max_symbols else ""
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        with connection.cursor() as cursor:
+            params: tuple[object, ...] = (max_symbols,) if max_symbols else ()
+            cursor.execute(
+                f"""
+                SELECT
+                  symbol AS Code,
+                  symbol AS Name,
+                  '' AS Sector
+                FROM {meta_table}
+                WHERE symbol REGEXP '^[0-9]{{6}}$'
+                  AND row_count > 0
+                ORDER BY symbol
+                {limit_sql}
+                """,
+                params,
+            )
+            universe = pd.DataFrame(cursor.fetchall())
+    finally:
+        connection.close()
+
+    if universe.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Sector"])
+    return universe[["Code", "Name", "Sector"]].fillna("").reset_index(drop=True)
+
+
+def load_collection_universe(config: Config, max_symbols: int | None = None) -> pd.DataFrame:
+    """OHLCV 전체 수집에 사용할 종목 유니버스를 구성합니다.
+
+    Args:
+        config: DB fallback에 사용할 실행 설정입니다.
+        max_symbols: 테스트용 최대 종목 수입니다.
+
+    Returns:
+        Code, Name, Sector 컬럼을 가진 수집 대상 종목 유니버스입니다.
+    """
+    try:
+        basic = fdr.StockListing("KRX")
     except Exception as exc:  # noqa: BLE001
-        logger.exception("시장 국면 조회 실패")
-        return MarketRegime(False, False, 0.0, 0.0, 0.0, str(exc))
+        logger.warning("KRX 종목 리스트 조회 실패. MariaDB OHLCV 캐시 종목으로 전체 수집 진행: %s", exc)
+        return load_collection_universe_from_db_cache(config, max_symbols=max_symbols)
+
+    try:
+        desc = fdr.StockListing("KRX-DESC")[["Code", "Sector"]]
+        universe = pd.merge(basic, desc, on="Code", how="left")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KRX-DESC 조회 실패. Sector 없이 전체 수집 진행: %s", exc)
+        universe = basic.copy()
+        universe["Sector"] = ""
+
+    universe = universe[universe["Market"].isin(["KOSPI", "KOSDAQ"])]
+    universe = universe[universe["Code"].astype(str).str.match(r"^\d{6}$")]
+    universe = universe[~universe["Name"].astype(str).str.contains(r"스팩|제[0-9]+호|우$|우B|우C|리츠|ETF|ETN", regex=True, na=False)]
+    universe = universe[["Code", "Name", "Sector"]].fillna("").reset_index(drop=True)
+    if max_symbols:
+        universe = universe.head(max_symbols)
+    return universe
+
+
+def collect_ohlcv_data(config: Config, *, max_symbols: int | None = None) -> Counter:
+    """종합분석과 VCP 실행 전에 전체 OHLCV 데이터를 MariaDB로 갱신합니다.
+
+    Args:
+        config: 전체 수집에 사용할 실행 설정입니다.
+        max_symbols: 테스트용 수집 종목 수 제한입니다. 운영 실행에서는 None을 사용합니다.
+
+    Returns:
+        수집 대상 수, 성공/실패 수, 최신 거래일 분포를 담은 Counter입니다.
+    """
+    stats: Counter = Counter()
+    if not config.collect_enabled:
+        logger.info("OHLCV 전체 수집 비활성화")
+        return stats
+
+    stock_start_date = (datetime.now(KST) - timedelta(days=config.collect_days)).strftime("%Y-%m-%d")
+    index_start_date = (datetime.now(KST) - timedelta(days=150)).strftime("%Y-%m-%d")
+    universe = load_collection_universe(config, max_symbols=max_symbols)
+    stock_symbols = [str(code) for code in universe["Code"].dropna().astype(str).tolist()]
+    symbols = ["KQ11", *stock_symbols]
+    stats["targets_total"] = len(symbols)
+    logger.info(
+        "OHLCV 전체 수집 시작: targets=%s stock_start_date=%s index_start_date=%s",
+        len(symbols),
+        stock_start_date,
+        index_start_date,
+    )
+
+    failed_samples: list[str] = []
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        futures = {
+            executor.submit(fetch_ohlcv, symbol, index_start_date if symbol == "KQ11" else stock_start_date, config): symbol
+            for symbol in symbols
+        }
+        for idx, future in enumerate(as_completed(futures), start=1):
+            symbol = futures[future]
+            try:
+                df = future.result()
+                stats["status_collected"] += 1
+                if not df.empty:
+                    latest_date = pd.Timestamp(df.index.max()).strftime("%Y-%m-%d")
+                    stats[f"latest_{latest_date}"] += 1
+            except Exception as exc:  # noqa: BLE001 - 종목별 수집 실패는 집계하고 다음 종목을 계속 처리한다.
+                stats["status_failed"] += 1
+                if len(failed_samples) < 20:
+                    failed_samples.append(f"{symbol}: {exc}")
+
+            if idx % 50 == 0 or idx == len(symbols):
+                logger.info(
+                    "OHLCV 수집 진행률: %s/%s collected=%s failed=%s",
+                    idx,
+                    len(symbols),
+                    stats["status_collected"],
+                    stats["status_failed"],
+                )
+
+    if failed_samples:
+        logger.warning("OHLCV 수집 실패 샘플: %s", failed_samples)
+    logger.info("OHLCV 전체 수집 종료: stats=%s", dict(stats))
+    return stats
+
+
+def load_universe_from_db_cache(config: Config, max_symbols: int | None = None) -> pd.DataFrame:
+    """FDR 종목 리스트가 실패했을 때 MariaDB 캐시에서 분석 대상 종목을 구성합니다.
+
+    Args:
+        config: 필터 기준과 DB 접속정보입니다.
+        max_symbols: 테스트용 최대 종목 수입니다.
+
+    Returns:
+        Code, Name, Sector 컬럼을 가진 종목 유니버스입니다.
+    """
+    ohlcv_table, meta_table = db_table_names(config)
+    limit_sql = "LIMIT %s" if max_symbols else ""
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        with connection.cursor() as cursor:
+            params: list[object] = [config.first_pass_min_close, config.first_pass_min_amount]
+            if max_symbols:
+                params.append(max_symbols)
+            cursor.execute(
+                f"""
+                SELECT
+                  m.symbol AS Code,
+                  m.symbol AS Name,
+                  '' AS Sector
+                FROM {meta_table} m
+                INNER JOIN {ohlcv_table} o
+                  ON o.symbol = m.symbol
+                 AND o.trade_date = m.max_trade_date
+                WHERE m.symbol REGEXP '^[0-9]{{6}}$'
+                  AND m.row_count >= 260
+                  AND o.open_price > 0
+                  AND o.high_price > 0
+                  AND o.low_price > 0
+                  AND o.close_price >= %s
+                  AND COALESCE(o.amount, o.close_price * o.volume) >= %s
+                ORDER BY m.max_trade_date DESC, m.symbol
+                {limit_sql}
+                """,
+                tuple(params),
+            )
+            universe = pd.DataFrame(cursor.fetchall())
+    finally:
+        connection.close()
+
+    if universe.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Sector"])
+    return universe[["Code", "Name", "Sector"]].fillna("").reset_index(drop=True)
 
 
 def load_universe(config: Config, max_symbols: int | None = None) -> pd.DataFrame:
-    basic = fdr.StockListing("KRX")
+    """KRX 종목 리스트를 불러오고 1차 필터를 적용합니다.
+
+    Args:
+        config: 가격과 거래대금 필터 기준입니다.
+        max_symbols: 테스트용 최대 종목 수입니다.
+
+    Returns:
+        Code, Name, Sector 컬럼을 가진 분석 대상 종목 유니버스입니다.
+    """
+    try:
+        basic = fdr.StockListing("KRX")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KRX 종목 리스트 조회 실패. MariaDB OHLCV 캐시 종목으로 진행: %s", exc)
+        return load_universe_from_db_cache(config, max_symbols=max_symbols)
+
     try:
         desc = fdr.StockListing("KRX-DESC")[["Code", "Sector"]]
         universe = pd.merge(basic, desc, on="Code", how="left")
@@ -377,385 +1211,116 @@ def load_universe(config: Config, max_symbols: int | None = None) -> pd.DataFram
     return universe
 
 
-def generate_quant_scenario(
-    curr_p: float,
-    flag_high: float,
-    high52: float,
-    vol_ratio: float,
-    flag_depth: float,
-    ref_open: float,
-    ref_date: str,
-) -> tuple[str, float, float, float]:
-    entry_price = flag_high
-    target_1 = entry_price * 1.10
-    target_2_str = f"{high52:,.0f}원 (52주 매물대)" if high52 > target_1 else "신고가 (추세 홀딩)"
-    stop_price = ref_open
+def db_scan_table_names(config: Config) -> tuple[str, str]:
+    """종합분석 실행 이력과 결과 테이블명을 생성합니다.
 
-    potential_profit = target_1 - entry_price
-    potential_loss = entry_price - stop_price
-    if potential_loss > 0:
-        rr_ratio = potential_profit / potential_loss
-        rr_str = f" | ⚖️ 손익비 1 : {rr_ratio:.2f}"
-    else:
-        rr_str = " | ⚖️ 손익비 계산 불가 (기준봉 시가가 매수가보다 높음)"
+    Args:
+        config: DB 테이블 접두사를 포함한 실행 설정입니다.
 
-    vol_desc = "거래량이 바짝 마르며(VCP)" if vol_ratio < 0.8 else "안정적인 거래량을 유지하며"
-    depth_desc = f"{flag_depth * 100:.1f}%의 타이트한 수렴" if flag_depth < 0.15 else "변동성 축소"
-
-    text = (
-        "⚡ [자체 퀀트 타점 & 시나리오]\n"
-        f"- {vol_desc} {depth_desc} 패턴을 완성 중이므로, 상단 돌파 시 강한 시세 분출이 기대됩니다.\n"
-        f"- [트레이딩 플랜] 현재가: {curr_p:,.0f}원 | 매수가: {entry_price:,.0f}원 (돌파 시) | "
-        f"1차 목표가: {target_1:,.0f}원 (+10%) | 2차 목표가: {target_2_str} | "
-        f"손절가: {stop_price:,.0f}원 ({ref_date} 기준봉 이탈 시){rr_str} | 타임스탑: 5일\n"
-        "- 주가가 상승할 때 환희에 빠지지 말고, 수익 구간에서는 이익을 현금화하는 규칙을 우선합니다."
-    )
-    return text, entry_price, target_1, stop_price
+    Returns:
+        스캔 실행 테이블명과 결과 테이블명입니다.
+    """
+    return db_scheme.scan_table_names(db_table_prefix(config))
 
 
-def get_stock_details(code: str, name: str, config: Config) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36"}
-    supply_summary = "🤝 [수급 현황] 정보 없음"
-    today = datetime.now(KST).replace(tzinfo=None)
-    one_month_ago = today - timedelta(days=30)
+def ensure_scan_report_tables(connection, config: Config) -> None:
+    """종합분석 결과 저장에 필요한 MariaDB 테이블을 생성합니다.
 
+    Args:
+        connection: 활성 MariaDB 연결 객체입니다.
+        config: DB 테이블 접두사를 포함한 실행 설정입니다.
+    """
+    db_scheme.ensure_scan_report_tables(connection, db_table_prefix(config))
+
+
+def save_reports(results: list[ScanResult], stats: Counter, start_ts: str, config: Config) -> int:
+    """종합분석 실행 통계와 후보 결과를 MariaDB에 저장합니다.
+
+    Args:
+        results: 종합분석에서 포착된 후보 목록입니다.
+        stats: 실행 중 집계한 상태와 스킵 사유 통계입니다.
+        start_ts: 실행 시작 시각 문자열입니다.
+        config: DB 접속정보와 테이블 접두사 설정입니다.
+
+    Returns:
+        저장된 스캔 실행 이력의 ID입니다.
+    """
+    runs_table, results_table = db_scan_table_names(config)
+    now = datetime.now(KST).replace(tzinfo=None)
+    stats_payload = json.dumps(dict(stats), ensure_ascii=False, default=str)
+    result_rows = [asdict(result) for result in results]
+
+    connection = db_connection(config)
     try:
-        frgn_url = f"https://finance.naver.com/item/frgn.naver?code={code}"
-        res_frgn = requests.get(frgn_url, headers=headers, timeout=config.request_timeout)
-        res_frgn.raise_for_status()
-        soup_frgn = BeautifulSoup(res_frgn.text, "html.parser")
+        ensure_scan_report_tables(connection, config)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {runs_table} (
+                  start_ts, found_total, stats_json, created_at
+                )
+                VALUES (%s, %s, %s, %s)
+                """,
+                (start_ts, len(results), stats_payload, now),
+            )
+            run_id = int(cursor.lastrowid)
 
-        inst_sum, frgn_sum, count = 0, 0, 0
-        for row in soup_frgn.select("table.type2 tr[onmouseout]"):
-            tds = row.select("td")
-            if len(tds) >= 7:
-                try:
-                    inst_sum += int(tds[5].text.strip().replace(",", ""))
-                    frgn_sum += int(tds[6].text.strip().replace(",", ""))
-                    count += 1
-                except ValueError:
-                    continue
-            if count >= 3:
-                break
-
-        if count > 0:
-            inst_str = f"+{inst_sum:,}" if inst_sum > 0 else f"{inst_sum:,}"
-            frgn_str = f"+{frgn_sum:,}" if frgn_sum > 0 else f"{frgn_sum:,}"
-            supply_summary = f"🤝 [최근 3일 수급] 기관: {inst_str}주 | 외국인: {frgn_str}주"
-    except Exception as exc:  # noqa: BLE001
-        logger.info("수급 조회 실패: %s %s", code, exc)
-
-    valid_news: list[str] = []
-    try:
-        news_url = f"https://finance.naver.com/item/news_news.naver?code={code}"
-        res_news = requests.get(news_url, headers=headers, timeout=config.request_timeout)
-        res_news.raise_for_status()
-        soup_news = BeautifulSoup(res_news.text, "html.parser")
-        for row in soup_news.select("table.type5 tbody tr"):
-            title_tag = row.select_one(".tit")
-            date_tag = row.select_one(".date")
-            if title_tag and date_tag:
-                try:
-                    news_date = datetime.strptime(date_tag.text.strip(), "%Y.%m.%d %H:%M")
-                    if news_date >= one_month_ago:
-                        valid_news.append(f"[네이버] {title_tag.text.strip()}")
-                except ValueError:
-                    continue
-    except Exception as exc:  # noqa: BLE001
-        logger.info("네이버 뉴스 조회 실패: %s %s", code, exc)
-
-    try:
-        encoded_query = quote(f'"{name} 특징주" OR "{name} 주식"')
-        google_rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
-        res_google = requests.get(google_rss_url, timeout=config.request_timeout)
-        res_google.raise_for_status()
-        root = ET.fromstring(res_google.text)
-        for item in root.findall(".//item")[:3]:
-            title_node = item.find("title")
-            if title_node is not None and title_node.text:
-                clean_title = title_node.text.rsplit(" - ", 1)[0]
-                valid_news.append(f"[구글] {clean_title}")
-    except Exception as exc:  # noqa: BLE001
-        logger.info("구글 뉴스 조회 실패: %s %s", code, exc)
-
-    if valid_news:
-        unique_news = list(dict.fromkeys(valid_news))[:5]
-        news_summary = "📰 [최신 핵심 뉴스]\n" + "\n".join(f"- {news}" for news in unique_news)
-    else:
-        news_summary = "📰 최근 1달 내 뚜렷한 관련 뉴스/이슈 없음"
-
-    return f"{supply_summary}\n────────────────\n{news_summary}"
-
-
-def analyze_stock(stock_info: tuple[str, str, str], kq_return_60: float, config: Config) -> AnalysisOutcome:
-    code, name, sector = stock_info
-    start_date = (datetime.now(KST) - timedelta(days=600)).strftime("%Y-%m-%d")
-
-    try:
-        df = fetch_ohlcv(code, start_date, config)
-        if len(df) < 260:
-            return AnalysisOutcome("skipped", code, name, "데이터 260행 미만")
-
-        df = df.copy()
-        for window in (10, 20, 50, 150, 200):
-            df[f"MA{window}"] = df["Close"].rolling(window=window).mean()
-        df["High52"] = df["High"].rolling(window=250).max()
-        df["Low52"] = df["Low"].rolling(window=250).min()
-        df["AvgVol50"] = df["Volume"].rolling(window=50).mean()
-        df["ADR_Day"] = ((df["High"] - df["Low"]) / df["Close"]) * 100
-
-        clean_df = df.dropna()
-        if len(clean_df) < 60:
-            return AnalysisOutcome("skipped", code, name, "클린 데이터 60행 미만")
-
-        today = clean_df.iloc[-1]
-        past_20 = clean_df.iloc[-21]
-        prev_day = clean_df.iloc[-2]
-
-        curr_p = float(today["Close"])
-        high52 = float(today["High52"])
-        low52 = float(today["Low52"])
-        curr_adr = float(clean_df["ADR_Day"].iloc[-20:].mean())
-        avg_turnover = float(today["AvgVol50"] * curr_p)
-
-        skip_checks = [
-            (curr_p < config.first_pass_min_close, "현재가 기준 미달"),
-            (avg_turnover < config.min_avg_turnover, "평균 거래대금 기준 미달"),
-            (curr_adr < config.min_adr, "ADR 기준 미달"),
-            (curr_p <= today["MA150"] or curr_p <= today["MA200"], "장기 이평선 하회"),
-            (today["MA150"] <= today["MA200"], "MA150 <= MA200"),
-            (today["MA200"] < past_20["MA200"], "MA200 하락"),
-            (today["MA50"] <= today["MA150"] or today["MA50"] <= today["MA200"], "MA50 정배열 실패"),
-            (curr_p <= today["MA50"], "현재가 MA50 하회"),
-            (curr_p < low52 * 1.30, "52주 저점 대비 상승폭 부족"),
-            (curr_p < high52 * 0.75, "52주 고점 대비 위치 부족"),
-        ]
-        for condition, reason in skip_checks:
-            if condition:
-                return AnalysisOutcome("skipped", code, name, reason)
-
-        recent_60 = clean_df.iloc[-61:-1]
-        pole_low = float(recent_60["Low"].min())
-        pole_high = float(recent_60["High"].max())
-        pole_ratio = pole_high / pole_low if pole_low else 0.0
-        if pole_ratio < 1.20:
-            return AnalysisOutcome("skipped", code, name, "60일 깃대 상승률 부족")
-
-        recent_15 = clean_df.iloc[-16:-1]
-        flag_high = float(recent_15["High"].max())
-        flag_low = float(recent_15["Low"].min())
-        flag_depth = (flag_high - flag_low) / flag_low if flag_low else 999.0
-        if flag_depth > 0.25:
-            return AnalysisOutcome("skipped", code, name, "15일 수렴폭 과대")
-
-        yang_bongs = recent_15[recent_15["Close"] > recent_15["Open"]]
-        if not yang_bongs.empty:
-            ref_candle = yang_bongs.loc[yang_bongs["Volume"].idxmax()]
-            ref_open = float(ref_candle["Open"])
-            ref_date = ref_candle.name.strftime("%m/%d")
-        else:
-            ref_open = flag_low
-            ref_date = "최근 저점"
-
-        avg_vol50 = float(today["AvgVol50"])
-        if avg_vol50 <= 0:
-            return AnalysisOutcome("skipped", code, name, "평균 거래량 0")
-        vol_ratio = float(today["Volume"] / avg_vol50)
-
-        # 기존 코드의 핵심 조건은 유지하되, 너무 늦은 돌파 종목은 제외한다.
-        if not (flag_high * 0.95 <= curr_p <= flag_high * 1.03):
-            return AnalysisOutcome("skipped", code, name, "돌파 가격 범위 이탈")
-
-        # 손절가가 매수가보다 높거나 손실폭이 지나치게 큰 케이스 제외.
-        entry_price = flag_high
-        if ref_open >= entry_price:
-            return AnalysisOutcome("skipped", code, name, "손절가 >= 매수가")
-        stop_loss_pct = (entry_price - ref_open) / entry_price
-        if stop_loss_pct > 0.15:
-            return AnalysisOutcome("skipped", code, name, "손절폭 15% 초과")
-
-        stars = 5 if pole_ratio >= 1.50 and flag_depth <= 0.12 and vol_ratio >= 1.5 else (
-            4 if pole_ratio >= 1.30 and flag_depth <= 0.15 and vol_ratio >= 1.2 else 3
-        )
-        star_icon = "⭐" * stars
-        breakout_pct = ((curr_p - flag_high) / flag_high) * 100
-
-        stock_return_60 = float((clean_df["Close"].iloc[-1] / clean_df["Close"].iloc[-60] - 1) * 100)
-        rs_score = stock_return_60 - kq_return_60
-        rs_status = (
-            f"✅ 초과 상승 (RS 스코어: {rs_score:+.1f}점 / 지수대비 {rs_score:+.1f}%)"
-            if rs_score > 0
-            else f"❌ 지수 하회 (RS 스코어: {rs_score:+.1f}점 / 지수대비 {rs_score:+.1f}%)"
-        )
-
-        range_today = float(today["High"] - today["Low"])
-        range_prev1 = float(clean_df.iloc[-2]["High"] - clean_df.iloc[-2]["Low"])
-        range_prev2 = float(clean_df.iloc[-3]["High"] - clean_df.iloc[-3]["Low"])
-        is_nr3 = range_today < range_prev1 and range_today < range_prev2
-        nr3_status = "✅ NR3 패턴 발생" if is_nr3 else "❌ NR3 패턴 미발생"
-
-        is_vcp = vol_ratio < 0.8 and flag_depth < 0.15
-        vcp_status = "✅ VCP 패턴 형성 중" if is_vcp else "❌ VCP 패턴 미형성"
-
-        ma50_up = today["MA50"] > prev_day["MA50"]
-        ma150_up = today["MA150"] > prev_day["MA150"]
-        ma200_up = today["MA200"] > prev_day["MA200"]
-        is_kulamegi_htf = bool(ma50_up and ma150_up and ma200_up and today["MA50"] > today["MA150"] > today["MA200"] and curr_p > today["MA50"])
-        kulamegi_htf_status = "✅ 쿨라메기 HTF 셋업" if is_kulamegi_htf else "❌ 쿨라메기 HTF 셋업 미발생"
-
-        fib_summary = "피보나치 레벨: 계산 불가"
-        if pole_high > pole_low:
-            diff = pole_high - pole_low
-            fib_levels = {
-                "23.6%": pole_high - diff * 0.236,
-                "38.2%": pole_high - diff * 0.382,
-                "50.0%": pole_high - diff * 0.500,
-                "61.8%": pole_high - diff * 0.618,
-                "78.6%": pole_high - diff * 0.786,
-                "100.0%": pole_low,
-            }
-            current_fib_desc = "해당 없음"
-            if curr_p >= pole_high:
-                current_fib_desc = f"고점 ({pole_high:,.0f}원) 상회"
-            elif curr_p <= pole_low:
-                current_fib_desc = f"저점 ({pole_low:,.0f}원) 하회"
-            else:
-                sorted_levels = sorted((value, label) for label, value in fib_levels.items())[::-1]
-                for idx in range(len(sorted_levels) - 1):
-                    upper_val, _ = sorted_levels[idx]
-                    lower_val, lower_name = sorted_levels[idx + 1]
-                    if lower_val <= curr_p <= upper_val:
-                        current_fib_desc = f"{lower_name} ({lower_val:,.0f}원) ~ {upper_val:,.0f}원 구간"
-                        break
-            fib_summary = f"피보나치 레벨: {current_fib_desc}"
-
-        quant_scenario, entry_p, target_p, stop_p = generate_quant_scenario(
-            curr_p=curr_p,
-            flag_high=flag_high,
-            high52=high52,
-            vol_ratio=vol_ratio,
-            flag_depth=flag_depth,
-            ref_open=ref_open,
-            ref_date=ref_date,
-        )
-
-        result = ScanResult(
-            stars=stars,
-            star_icon=star_icon,
-            name=name,
-            code=code,
-            sector=sector,
-            curr_p=curr_p,
-            breakout_pct=breakout_pct,
-            pole_ratio=pole_ratio,
-            flag_depth=flag_depth,
-            vol_ratio=vol_ratio,
-            curr_adr=curr_adr,
-            avg_turnover=avg_turnover,
-            nr3_status=nr3_status,
-            vcp_status=vcp_status,
-            kulamegi_htf_status=kulamegi_htf_status,
-            fib_summary=fib_summary,
-            rs_status=rs_status,
-            rs_score=rs_score,
-            stock_return_60=stock_return_60,
-            entry_p=entry_p,
-            target_p=target_p,
-            stop_p=stop_p,
-            ref_date=ref_date,
-            quant_scenario=quant_scenario,
-        )
-        return AnalysisOutcome("found", code, name, "통과", result=result)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("종목 분석 실패: %s %s", code, name)
-        return AnalysisOutcome("failed", code, name, "예외", error=str(exc))
-
-
-def generate_chart(code: str, name: str, entry_p: float, target_p: float, stop_p: float, config: Config) -> Path | None:
-    try:
-        start_date = (datetime.now(KST) - timedelta(days=120)).strftime("%Y-%m-%d")
-        df = fetch_ohlcv(code, start_date, config)
-        if len(df) < 20:
-            return None
-
-        mc = mpf.make_marketcolors(up="r", down="b", edge="inherit", wick="inherit", volume="inherit")
-        rc_params = {"font.family": mpl.rcParams["font.family"], "axes.unicode_minus": False}
-        style = mpf.make_mpf_style(marketcolors=mc, gridstyle=":", rc=rc_params)
-        hlines_config = dict(
-            hlines=[target_p, entry_p, stop_p],
-            colors=["r", "g", "b"],
-            linestyle="--",
-            alpha=0.6,
-            linewidths=1.5,
-        )
-
-        fig, axlist = mpf.plot(
-            df,
-            type="candle",
-            volume=True,
-            mav=(5, 10, 20, 50),
-            title=f"{name} ({code}) - 3 Months Setup",
-            hlines=hlines_config,
-            style=style,
-            figsize=(10, 6),
-            returnfig=True,
-        )
-
-        ax = axlist[0]
-        bbox_props = dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.7)
-        ax.text(0, target_p, " 목표가", color="red", fontsize=10, va="bottom", ha="left", fontweight="bold", bbox=bbox_props)
-        ax.text(0, entry_p, " 매수가", color="green", fontsize=10, va="bottom", ha="left", fontweight="bold", bbox=bbox_props)
-        ax.text(0, stop_p, " 손절가", color="blue", fontsize=10, va="top", ha="left", fontweight="bold", bbox=bbox_props)
-
-        output = CHART_DIR / f"chart_{code}_{datetime.now(KST).strftime('%Y%m%d_%H%M%S')}.png"
-        fig.savefig(output, dpi=140, bbox_inches="tight")
-        plt.close(fig)
-        return output
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("차트 생성 실패: %s %s", code, exc)
-        return None
-
-
-def build_message(stock: ScanResult) -> str:
-    sector = stock.sector if str(stock.sector).lower() != "nan" and stock.sector else "기타"
-    return (
-        f"{stock.star_icon} [정통 셋업] {stock.name}({stock.code}) - {sector}\n"
-        f"💰 현재가: {stock.curr_p:,.0f}원 (수렴 돌파: {stock.breakout_pct:+.1f}%)\n"
-        f"📈 깃대: +{(stock.pole_ratio - 1) * 100:.0f}% | 🎌 수렴: {stock.flag_depth * 100:.1f}%\n"
-        f"🔥 거래량: {stock.vol_ratio:.1f}배 | ADR: {stock.curr_adr:.1f}%\n"
-        "────────────────\n"
-        "📊 [핵심 기술적 분석]\n"
-        f"   - 현재가: {stock.curr_p:,.0f}원\n"
-        f"   - 평균 거래대금(50일): {stock.avg_turnover:,.0f}원\n"
-        f"   - 시장 상대강도: {stock.rs_status}\n"
-        f"   - 3-Bar (NR3): {stock.nr3_status}\n"
-        f"   - VCP 패턴: {stock.vcp_status}\n"
-        f"   - 쿨라메기 HTF 셋업: {stock.kulamegi_htf_status}\n"
-        f"   - {stock.fib_summary}\n"
-        "────────────────\n"
-        f"{stock.material_info}\n"
-        "────────────────\n"
-        f"{stock.quant_scenario}"
-    )
-
-
-def save_reports(results: list[ScanResult], stats: Counter, start_ts: str) -> tuple[Path, Path]:
-    rows = [asdict(result) for result in results]
-    csv_path = REPORT_DIR / f"scan_results_{start_ts}.csv"
-    pd.DataFrame(rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
-
-    stats_path = REPORT_DIR / f"scan_stats_{start_ts}.json"
-    stats_path.write_text(json.dumps(dict(stats), ensure_ascii=False, indent=2), encoding="utf-8")
-    return csv_path, stats_path
+            if result_rows:
+                cursor.executemany(
+                    f"""
+                    INSERT INTO {results_table} (
+                      run_id, rank_no, code, name, sector, stars,
+                      rs_score, avg_turnover, curr_p, result_json, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            run_id,
+                            rank_no,
+                            row["code"],
+                            row["name"],
+                            row["sector"],
+                            row["stars"],
+                            row["rs_score"],
+                            row["avg_turnover"],
+                            row["curr_p"],
+                            json.dumps(row, ensure_ascii=False, default=str),
+                            now,
+                        )
+                        for rank_no, row in enumerate(result_rows, start=1)
+                    ],
+                )
+        connection.commit()
+        return run_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bool) -> int:
+    """종합분석을 실행하고 이후 VCP 스캔 파이프라인을 이어서 실행합니다.
+
+    Args:
+        config: 전체 실행 설정입니다.
+        dry_run: 실제 텔레그램 전송 없이 실행할지 여부입니다.
+        max_symbols: 테스트용 최대 종목 수입니다.
+        no_charts: 차트 생성과 전송을 생략할지 여부입니다.
+
+    Returns:
+        프로세스 종료 코드입니다.
+    """
     setup_korean_font()
     start_ts = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
     now_display = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     logger.info("마스터 스캐너 시작: %s", now_display)
 
     stats: Counter = Counter()
+    collection_stats = collect_ohlcv_data(config)
+    for key, value in collection_stats.items():
+        stats[f"collection_{key}"] = value
 
     regime = check_market_regime(config)
     if not regime.ok:
@@ -801,9 +1366,8 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
     for result in found[: config.top_send_limit]:
         result.material_info = get_stock_details(result.code, result.name, config)
 
-    csv_path, stats_path = save_reports(found, stats, start_ts)
-    logger.info("결과 CSV 저장: %s", csv_path)
-    logger.info("통계 JSON 저장: %s", stats_path)
+    scan_run_id = save_reports(found, stats, start_ts, config)
+    logger.info("스캔 결과 DB 저장: run_id=%s found=%s", scan_run_id, len(found))
 
     if found:
         sectors = [result.sector for result in found if result.sector]
@@ -815,9 +1379,7 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
 
         intro_msg = (
             f"{regime_msg}🔔 [퀀트 스캔 결과] 포착 종목: {len(found)}개\n"
-            f"⏰ 스캔 일시: {now_display}\n"
-            f"📄 CSV: {csv_path}\n"
-            f"📊 Stats: {stats_path}\n\n"
+            f"⏰ 스캔 일시: {now_display}\n\n"
             f"{sector_warning}👇 상위 {min(config.top_send_limit, len(found))}개 브리핑을 시작합니다."
         )
         send_telegram_msg(intro_msg, config, dry_run=dry_run)
@@ -832,32 +1394,46 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
             send_telegram_msg(build_message(result), config, dry_run=dry_run)
             time.sleep(0.5)
     else:
-        no_result_msg = f"{regime_msg}💡 오늘은 조건을 만족하는 종목이 없습니다.\n📄 CSV: {csv_path}\n📊 Stats: {stats_path}"
+        no_result_msg = f"{regime_msg}💡 오늘은 조건을 만족하는 종목이 없습니다."
         send_telegram_msg(no_result_msg, config, dry_run=dry_run)
         logger.info("조건 만족 종목 없음")
+
+    run_vcp_pipeline(config, dry_run=dry_run, max_symbols=max_symbols, no_charts=no_charts)
 
     logger.info("스캐너 종료: stats=%s", dict(stats))
     return 0
 
 
 def parse_args() -> argparse.Namespace:
+    """명령행 인자를 파싱합니다.
+
+    Returns:
+        argparse로 파싱된 실행 옵션입니다.
+    """
     parser = argparse.ArgumentParser(description="KRX Master Scanner")
     parser.add_argument("--dry-run", action="store_true", help="Telegram 전송 없이 로컬 실행/리포트만 생성")
     parser.add_argument("--max-symbols", type=int, default=None, help="테스트용 분석 종목 수 제한")
     parser.add_argument("--workers", type=int, default=None, help="병렬 분석 worker 수 override")
     parser.add_argument("--force-refresh", action="store_true", help="OHLCV 캐시 무시")
     parser.add_argument("--no-charts", action="store_true", help="차트 생성/전송 생략")
+    parser.add_argument("--no-vcp", action="store_true", help="종합분석 후 VCP 스캔 생략")
     return parser.parse_args()
 
 
 def main() -> int:
+    """CLI 진입점에서 설정을 구성하고 스캐너를 실행합니다.
+
+    Returns:
+        프로세스 종료 코드입니다.
+    """
     args = parse_args()
     config = Config()
-    if args.workers is not None or args.force_refresh:
-        config = Config(
-            max_workers=args.workers if args.workers is not None else config.max_workers,
-            force_refresh=True if args.force_refresh else config.force_refresh,
-        )
+    if args.workers is not None:
+        config = replace(config, max_workers=args.workers)
+    if args.force_refresh:
+        config = replace(config, force_refresh=True)
+    if args.no_vcp:
+        config = replace(config, vcp_enabled=False)
     return run(config, dry_run=args.dry_run, max_symbols=args.max_symbols, no_charts=args.no_charts)
 
 
