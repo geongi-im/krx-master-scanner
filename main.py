@@ -51,6 +51,8 @@ ASSET_DIR = APP_DIR / "assets"
 CACHE_START_TOLERANCE_DAYS = 7
 VCP_LOOKBACK_DAYS = 400
 CHART_RETENTION_DAYS = 3
+TARGET_CACHE_MIN_COVERAGE_RATIO = 0.90
+TARGET_CACHE_MIN_READY_SYMBOLS = 1000
 
 for directory in (DATA_DIR, CHART_DIR, LOG_DIR, ASSET_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -131,6 +133,7 @@ class Config:
     top_send_limit: int = env_int("TOP_SEND_LIMIT", 20)
     send_charts: bool = env_bool("SEND_CHARTS", True)
     force_refresh: bool = env_bool("FORCE_REFRESH", False)
+    target_date: str | None = None
 
     collect_enabled: bool = env_bool("COLLECT_ENABLED", True)
     collect_days: int = env_int("COLLECT_DAYS", 600)
@@ -153,6 +156,41 @@ class Config:
             return False
         placeholders = {"YOUR_BOT_TOKEN_HERE", "YOUR_CHAT_ID_HERE", ""}
         return self.telegram_bot_token not in placeholders and self.telegram_chat_id not in placeholders
+
+
+def parse_target_date(value: str | None) -> str | None:
+    """CLI 기준일 문자열을 YYYY-MM-DD 형식으로 검증해 반환합니다."""
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--target-date는 YYYY-MM-DD 형식이어야 합니다.") from exc
+
+
+def config_target_datetime(config: Config) -> datetime:
+    """실행 기준 시각을 반환합니다. 기준일 지정 시 해당일 장마감 이후로 간주합니다."""
+    if config.target_date:
+        parsed = datetime.strptime(config.target_date, "%Y-%m-%d").date()
+        return datetime(parsed.year, parsed.month, parsed.day, 20, 0, tzinfo=KST)
+    return datetime.now(KST)
+
+
+def config_end_date(config: Config) -> str | None:
+    """OHLCV 조회 종료일 문자열을 반환합니다. 실시간 실행은 None입니다."""
+    return config.target_date
+
+
+def window_start_date(config: Config, days: int) -> str:
+    """실행 기준일에서 지정 일수만큼 이전 날짜 문자열을 반환합니다."""
+    return (config_target_datetime(config) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def format_target_date(config: Config) -> str:
+    """텔레그램 메시지에 표시할 타겟 날짜를 한국어 날짜/요일 형식으로 반환합니다."""
+    weekday_names = ("월", "화", "수", "목", "금", "토", "일")
+    target = config_target_datetime(config).date()
+    return f"{target.year}년 {target.month}월 {target.day}일({weekday_names[target.weekday()]})"
 
 
 def setup_logging() -> logging.Logger:
@@ -431,13 +469,115 @@ def ohlcv_db_params(symbol: str, df: pd.DataFrame) -> list[tuple[object, ...]]:
     return params
 
 
-def read_cached_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame | None:
+def rebuild_ohlcv_cache_meta(connection, config: Config, *, symbol: str | None = None) -> int:
+    """실제 유효 OHLCV row 기준으로 캐시 메타 정보를 재계산합니다."""
+    ohlcv_table, meta_table = db_table_names(config)
+    valid_where = """
+        open_price > 0
+        AND high_price > 0
+        AND low_price > 0
+        AND close_price > 0
+    """
+    symbol_filter = "AND symbol = %s" if symbol is not None else ""
+    params: tuple[object, ...] = (symbol,) if symbol is not None else ()
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT COUNT(DISTINCT symbol) AS symbol_count
+            FROM {ohlcv_table}
+            WHERE {valid_where}
+              {symbol_filter}
+            """,
+            params,
+        )
+        updated_symbols = int(cursor.fetchone()["symbol_count"] or 0)
+
+        if symbol is not None:
+            cursor.execute(
+                f"""
+                DELETE FROM {meta_table}
+                WHERE symbol = %s
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM {ohlcv_table}
+                    WHERE symbol = %s
+                      AND {valid_where}
+                  )
+                """,
+                (symbol, symbol),
+            )
+
+        cursor.execute(
+            f"""
+            INSERT INTO {meta_table} (
+              symbol, min_trade_date, max_trade_date, row_count, last_cached_at
+            )
+            SELECT
+              symbol,
+              MIN(trade_date) AS min_trade_date,
+              MAX(trade_date) AS max_trade_date,
+              COUNT(*) AS row_count,
+              NOW() AS last_cached_at
+            FROM {ohlcv_table}
+            WHERE {valid_where}
+              {symbol_filter}
+            GROUP BY symbol
+            ON DUPLICATE KEY UPDATE
+              min_trade_date = VALUES(min_trade_date),
+              max_trade_date = VALUES(max_trade_date),
+              row_count = VALUES(row_count),
+              last_cached_at = VALUES(last_cached_at),
+              updated_at = CURRENT_TIMESTAMP
+            """,
+            params,
+        )
+    return updated_symbols
+
+
+def delete_invalid_ohlcv_rows(connection, config: Config) -> int:
+    """분석에 사용할 수 없는 OHLC row를 캐시 테이블에서 삭제합니다."""
+    ohlcv_table, _ = db_table_names(config)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            DELETE FROM {ohlcv_table}
+            WHERE open_price <= 0
+               OR high_price <= 0
+               OR low_price <= 0
+               OR close_price <= 0
+            """
+        )
+        return int(cursor.rowcount)
+
+
+def repair_ohlcv_cache(config: Config) -> dict[str, int]:
+    """기존 OHLCV 캐시 오염 row를 제거하고 메타 정보를 재계산합니다."""
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        deleted_invalid_rows = delete_invalid_ohlcv_rows(connection, config)
+        updated_meta_symbols = rebuild_ohlcv_cache_meta(connection, config)
+        connection.commit()
+        return {
+            "deleted_invalid_rows": deleted_invalid_rows,
+            "updated_meta_symbols": updated_meta_symbols,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def read_cached_ohlcv(symbol: str, start_date: str, config: Config, *, end_date: str | None = None) -> pd.DataFrame | None:
     """MariaDB에서 요청 시작일 이후의 OHLCV 캐시를 읽습니다.
 
     Args:
         symbol: 조회할 종목 코드입니다.
         start_date: 필요한 데이터의 시작일입니다.
         config: DB 접속정보와 캐시 설정입니다.
+        end_date: 필요한 데이터의 종료일입니다. None이면 종료일 제한이 없습니다.
 
     Returns:
         캐시가 유효하면 OHLCV 데이터프레임, 사용할 캐시가 없으면 None입니다.
@@ -446,6 +586,7 @@ def read_cached_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFr
         return None
 
     requested_start = pd.Timestamp(start_date)
+    requested_end = pd.Timestamp(end_date) if end_date else None
     ohlcv_table, meta_table = db_table_names(config)
     connection = db_connection(config)
     try:
@@ -471,7 +612,15 @@ def read_cached_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFr
                 return None
             if pd.Timestamp(max_trade_date) < requested_start:
                 return None
+            if requested_end is not None and pd.Timestamp(min_trade_date) > requested_end:
+                return None
 
+            end_filter_sql = "AND trade_date <= %s" if requested_end is not None else ""
+            params: tuple[object, ...]
+            if requested_end is not None:
+                params = (symbol, requested_start.date(), requested_end.date())
+            else:
+                params = (symbol, requested_start.date())
             cursor.execute(
                 f"""
                 SELECT
@@ -486,13 +635,14 @@ def read_cached_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFr
                 FROM {ohlcv_table}
                 WHERE symbol = %s
                   AND trade_date >= %s
+                  {end_filter_sql}
                   AND open_price > 0
                   AND high_price > 0
                   AND low_price > 0
                   AND close_price > 0
                 ORDER BY trade_date
                 """,
-                (symbol, requested_start.date()),
+                params,
             )
             df = ohlcv_from_db_rows(list(cursor.fetchall()))
             if df.empty:
@@ -524,12 +674,13 @@ def expected_latest_trade_date(now: datetime | None = None) -> date:
     return candidate
 
 
-def cache_is_fresh(symbol: str, config: Config) -> bool:
+def cache_is_fresh(symbol: str, config: Config, *, end_date: str | None = None) -> bool:
     """종목의 MariaDB 캐시가 TTL 안에 갱신되었는지 확인합니다.
 
     Args:
         symbol: 확인할 종목 코드입니다.
         config: 캐시 TTL과 DB 접속정보를 포함한 설정입니다.
+        end_date: 필요한 데이터의 종료일입니다. 지정되면 해당 기준일 데이터 포함 여부를 우선합니다.
 
     Returns:
         캐시가 강제 갱신 대상이 아니고 TTL 안에 있으며 기대 최신 거래일까지 포함하면 True입니다.
@@ -553,8 +704,15 @@ def cache_is_fresh(symbol: str, config: Config) -> bool:
             row = cursor.fetchone()
             if not row or not row["last_cached_at"]:
                 return False
-            if not row["max_trade_date"] or row["max_trade_date"] < expected_latest_trade_date():
+            if end_date:
+                parsed_end = pd.Timestamp(end_date).date()
+                reference_now = datetime(parsed_end.year, parsed_end.month, parsed_end.day, 20, 0, tzinfo=KST)
+            else:
+                reference_now = config_target_datetime(config)
+            if not row["max_trade_date"] or row["max_trade_date"] < expected_latest_trade_date(reference_now):
                 return False
+            if end_date:
+                return True
             last_cached_at = row["last_cached_at"]
             age_hours = (datetime.now() - last_cached_at).total_seconds() / 3600
             return age_hours <= config.cache_ttl_hours
@@ -579,7 +737,7 @@ def write_cached_ohlcv(symbol: str, df: pd.DataFrame, config: Config | None = No
     if not params:
         return
 
-    ohlcv_table, meta_table = db_table_names(config)
+    ohlcv_table, _ = db_table_names(config)
     connection = db_connection(config)
     try:
         ensure_ohlcv_cache_tables(connection, config)
@@ -604,27 +762,7 @@ def write_cached_ohlcv(symbol: str, df: pd.DataFrame, config: Config | None = No
                 """,
                 params,
             )
-            cursor.execute(
-                f"""
-                INSERT INTO {meta_table} (
-                  symbol, min_trade_date, max_trade_date, row_count, last_cached_at
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                  min_trade_date = VALUES(min_trade_date),
-                  max_trade_date = VALUES(max_trade_date),
-                  row_count = VALUES(row_count),
-                  last_cached_at = VALUES(last_cached_at),
-                  updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    symbol,
-                    pd.Timestamp(df.index.min()).date(),
-                    pd.Timestamp(df.index.max()).date(),
-                    len(df),
-                    datetime.now(),
-                ),
-            )
+            rebuild_ohlcv_cache_meta(connection, config, symbol=symbol)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -633,13 +771,14 @@ def write_cached_ohlcv(symbol: str, df: pd.DataFrame, config: Config | None = No
         connection.close()
 
 
-def merge_ohlcv(cached: pd.DataFrame | None, fetched: pd.DataFrame, start_date: str) -> pd.DataFrame:
+def merge_ohlcv(cached: pd.DataFrame | None, fetched: pd.DataFrame, start_date: str, *, end_date: str | None = None) -> pd.DataFrame:
     """캐시 데이터와 새로 조회한 OHLCV 데이터를 병합합니다.
 
     Args:
         cached: 기존 MariaDB 캐시 데이터입니다.
         fetched: FDR에서 새로 조회한 데이터입니다.
         start_date: 반환 데이터의 최소 시작일입니다.
+        end_date: 반환 데이터의 최대 종료일입니다. None이면 종료일 제한이 없습니다.
 
     Returns:
         중복 날짜를 정리하고 시작일 이후만 남긴 OHLCV 데이터프레임입니다.
@@ -650,16 +789,20 @@ def merge_ohlcv(cached: pd.DataFrame | None, fetched: pd.DataFrame, start_date: 
     else:
         merged = fetched
     merged = normalize_ohlcv(merged)
-    return merged.loc[merged.index >= pd.Timestamp(start_date)]
+    result = merged.loc[merged.index >= pd.Timestamp(start_date)]
+    if end_date:
+        result = result.loc[result.index <= pd.Timestamp(end_date)]
+    return result
 
 
-def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, start_date: str, config: Config, *, end_date: str | None = None) -> pd.DataFrame:
     """MariaDB 캐시를 우선 사용해 종목 OHLCV 데이터를 조회합니다.
 
     Args:
         symbol: 조회할 종목 코드입니다.
         start_date: 필요한 데이터의 시작일입니다.
         config: 캐시, 재시도, DB 접속 설정입니다.
+        end_date: 필요한 데이터의 종료일입니다. None이면 현재까지 조회합니다.
 
     Returns:
         분석에 사용할 OHLCV 데이터프레임입니다.
@@ -667,22 +810,25 @@ def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
     Raises:
         RuntimeError: 캐시도 없고 외부 조회도 모두 실패한 경우 발생합니다.
     """
-    cached = read_cached_ohlcv(symbol, start_date, config)
-    if cached is not None and cache_is_fresh(symbol, config):
+    end_date = end_date or config_end_date(config)
+    cached = read_cached_ohlcv(symbol, start_date, config, end_date=end_date)
+    if cached is not None and cache_is_fresh(symbol, config, end_date=end_date):
         return cached
 
     fetch_start = start_date
     if cached is not None and not cached.empty:
         # 마지막 저장일을 하루 겹쳐 받아서 당일 데이터 수정/보정분은 새 값으로 덮어쓴다.
         fetch_start = cached.index.max().strftime("%Y-%m-%d")
+    if end_date and pd.Timestamp(fetch_start) > pd.Timestamp(end_date):
+        return cached.loc[cached.index >= pd.Timestamp(start_date)] if cached is not None else pd.DataFrame()
 
     last_error: Exception | None = None
     for attempt in range(1, config.fetch_retries + 1):
         try:
-            fetched = fdr.DataReader(symbol, fetch_start)
+            fetched = fdr.DataReader(symbol, fetch_start, end_date) if end_date else fdr.DataReader(symbol, fetch_start)
             if fetched is None or fetched.empty:
                 raise ValueError("empty dataframe")
-            df = merge_ohlcv(cached, fetched, start_date)
+            df = merge_ohlcv(cached, fetched, start_date, end_date=end_date)
             write_cached_ohlcv(symbol, df, config)
             return df
         except Exception as exc:  # noqa: BLE001 - 종목별 실패를 집계해야 함
@@ -694,7 +840,10 @@ def fetch_ohlcv(symbol: str, start_date: str, config: Config) -> pd.DataFrame:
 
     if cached is not None and not cached.empty and not config.force_refresh:
         logger.warning("OHLCV 갱신 실패. 기존 DB 캐시 사용: symbol=%s error=%s", symbol, last_error)
-        return cached.loc[cached.index >= pd.Timestamp(start_date)]
+        result = cached.loc[cached.index >= pd.Timestamp(start_date)]
+        if end_date:
+            result = result.loc[result.index <= pd.Timestamp(end_date)]
+        return result
 
     raise RuntimeError(f"OHLCV 조회 실패: {symbol}: {last_error}")
 
@@ -918,6 +1067,30 @@ def format_vcp_message(record: pd.Series, *, rank_no: int) -> str:
     )
 
 
+def format_market_regime_message(regime: Any, config: Config) -> str:
+    """시장 국면 점검 결과를 독립 텔레그램 메시지로 구성합니다."""
+    prefix = f"📅 타겟 날짜: {format_target_date(config)}\n"
+    if not regime.ok:
+        return f"{prefix}⚠️ [시장국면]\n코스닥 지수 조회 실패: {regime.error}\n시장 국면은 '불명'으로 표시하고 스캔은 계속합니다."
+
+    if not regime.is_bull_market:
+        return (
+            f"{prefix}"
+            "🛑 [시장국면]\n"
+            f"코스닥 지수({regime.current:,.2f})가 50일선({regime.ma50:,.2f})을 하회합니다.\n"
+            f"60거래일 수익률: {regime.kq_return_60:+.2f}%\n"
+            "수익 보전과 현금 비중 확대를 우선합니다."
+        )
+
+    return (
+        f"{prefix}"
+        "✅ [시장국면]\n"
+        f"코스닥 지수({regime.current:,.2f})가 50일선({regime.ma50:,.2f}) 위에 있습니다.\n"
+        f"60거래일 수익률: {regime.kq_return_60:+.2f}%\n"
+        "시장 국면은 기본 스캔 진행에 우호적입니다."
+    )
+
+
 def run_vcp_pipeline(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bool) -> None:
     """종합분석 이후 VCP 스캔과 텔레그램 전송을 실행합니다.
 
@@ -948,6 +1121,7 @@ def run_vcp_pipeline(config: Config, *, dry_run: bool, max_symbols: int | None, 
             max_symbols=max_symbols,
             criteria=criteria,
             days=VCP_LOOKBACK_DAYS,
+            target_date=config.target_date,
             save_charts=save_charts,
             charts_dir=CHART_DIR,
             use_project_cache=True,
@@ -961,12 +1135,13 @@ def run_vcp_pipeline(config: Config, *, dry_run: bool, max_symbols: int | None, 
     logger.info("VCP 스캔 결과 DB 저장: run_id=%s candidates=%s", vcp_run_id, len(candidates))
 
     if candidates.empty:
-        send_telegram_msg("💡 VCP 조건을 만족하는 종목이 없습니다.", config, dry_run=dry_run)
+        send_telegram_msg("🔎 [VCP]\n💡 VCP 조건을 만족하는 종목이 없습니다.", config, dry_run=dry_run)
         return
 
     send_limit = min(config.top_send_limit, len(candidates))
     intro_msg = (
-        f"🔎 [VCP 스캔 결과] 후보 종목: {len(candidates)}개\n"
+        "🔎 [VCP]\n"
+        f"[VCP 스캔 결과] 후보 종목: {len(candidates)}개\n"
         f"⏱ 소요 시간: {elapsed_seconds:.1f}초\n\n"
         f"👇 상위 {send_limit}개 VCP 차트와 브리핑을 보냅니다."
     )
@@ -1058,6 +1233,70 @@ def load_collection_universe(config: Config, max_symbols: int | None = None) -> 
     return universe
 
 
+def get_target_date_cache_status(config: Config) -> dict[str, Any]:
+    """target_date 기준 분석에 필요한 OHLCV 캐시 커버리지를 계산합니다."""
+    if not config.target_date:
+        return {"is_ready": False, "reason": "target_date 없음"}
+
+    _, meta_table = db_table_names(config)
+    target_trade_date = expected_latest_trade_date(config_target_datetime(config))
+    stock_start_limit = (pd.Timestamp(window_start_date(config, config.collect_days)) + pd.Timedelta(days=CACHE_START_TOLERANCE_DAYS)).date()
+    index_start_limit = (pd.Timestamp(window_start_date(config, 150)) + pd.Timedelta(days=CACHE_START_TOLERANCE_DAYS)).date()
+
+    connection = db_connection(config)
+    try:
+        ensure_ohlcv_cache_tables(connection, config)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                  SUM(CASE
+                    WHEN symbol = 'KQ11'
+                     AND min_trade_date <= %s
+                     AND max_trade_date >= %s
+                    THEN 1 ELSE 0 END) AS index_ready,
+                  SUM(CASE
+                    WHEN symbol REGEXP '^[0-9]{{6}}$'
+                     AND row_count >= 200
+                     AND min_trade_date <= %s
+                    THEN 1 ELSE 0 END) AS eligible_stocks,
+                  SUM(CASE
+                    WHEN symbol REGEXP '^[0-9]{{6}}$'
+                     AND row_count >= 200
+                     AND min_trade_date <= %s
+                     AND max_trade_date >= %s
+                    THEN 1 ELSE 0 END) AS ready_stocks
+                FROM {meta_table}
+                WHERE symbol = 'KQ11'
+                   OR symbol REGEXP '^[0-9]{{6}}$'
+                """,
+                (index_start_limit, target_trade_date, stock_start_limit, stock_start_limit, target_trade_date),
+            )
+            row = cursor.fetchone() or {}
+    finally:
+        connection.close()
+
+    index_ready = int(row.get("index_ready") or 0) > 0
+    eligible_stocks = int(row.get("eligible_stocks") or 0)
+    ready_stocks = int(row.get("ready_stocks") or 0)
+    coverage_ratio = (ready_stocks / eligible_stocks) if eligible_stocks else 0.0
+    is_ready = (
+        index_ready
+        and ready_stocks >= TARGET_CACHE_MIN_READY_SYMBOLS
+        and coverage_ratio >= TARGET_CACHE_MIN_COVERAGE_RATIO
+    )
+    return {
+        "is_ready": is_ready,
+        "target_trade_date": target_trade_date,
+        "index_ready": index_ready,
+        "eligible_stocks": eligible_stocks,
+        "ready_stocks": ready_stocks,
+        "coverage_ratio": coverage_ratio,
+        "min_ready_symbols": TARGET_CACHE_MIN_READY_SYMBOLS,
+        "min_coverage_ratio": TARGET_CACHE_MIN_COVERAGE_RATIO,
+    }
+
+
 def collect_ohlcv_data(config: Config, *, max_symbols: int | None = None) -> Counter:
     """종합분석과 VCP 실행 전에 전체 OHLCV 데이터를 MariaDB로 갱신합니다.
 
@@ -1073,17 +1312,43 @@ def collect_ohlcv_data(config: Config, *, max_symbols: int | None = None) -> Cou
         logger.info("OHLCV 전체 수집 비활성화")
         return stats
 
-    stock_start_date = (datetime.now(KST) - timedelta(days=config.collect_days)).strftime("%Y-%m-%d")
-    index_start_date = (datetime.now(KST) - timedelta(days=150)).strftime("%Y-%m-%d")
+    if config.target_date:
+        try:
+            cache_status = get_target_date_cache_status(config)
+            if cache_status["is_ready"]:
+                ready_stocks = int(cache_status["ready_stocks"])
+                eligible_stocks = int(cache_status["eligible_stocks"])
+                coverage_pct = float(cache_status["coverage_ratio"]) * 100
+                stats["targets_total"] = ready_stocks + 1
+                stats["status_cache_ready"] = ready_stocks + 1
+                stats["collection_skipped_target_cache_ready"] = 1
+                stats[f"latest_{cache_status['target_trade_date']}"] = ready_stocks + 1
+                logger.info(
+                    "target_date 캐시 충분. OHLCV 전체 수집 생략: target_trade_date=%s ready_stocks=%s eligible_stocks=%s coverage=%.2f%% index_ready=%s",
+                    cache_status["target_trade_date"],
+                    ready_stocks,
+                    eligible_stocks,
+                    coverage_pct,
+                    cache_status["index_ready"],
+                )
+                return stats
+
+            logger.info("target_date 캐시 부족. OHLCV 전체 수집 진행: %s", cache_status)
+        except Exception as exc:  # noqa: BLE001 - 캐시 확인 실패 시 기존 수집 경로로 진행
+            logger.warning("target_date 캐시 커버리지 확인 실패. OHLCV 전체 수집 진행: %s", exc)
+
+    stock_start_date = window_start_date(config, config.collect_days)
+    index_start_date = window_start_date(config, 150)
     universe = load_collection_universe(config, max_symbols=max_symbols)
     stock_symbols = [str(code) for code in universe["Code"].dropna().astype(str).tolist()]
     symbols = ["KQ11", *stock_symbols]
     stats["targets_total"] = len(symbols)
     logger.info(
-        "OHLCV 전체 수집 시작: targets=%s stock_start_date=%s index_start_date=%s",
+        "OHLCV 전체 수집 시작: targets=%s stock_start_date=%s index_start_date=%s target_date=%s",
         len(symbols),
         stock_start_date,
         index_start_date,
+        config.target_date or "-",
     )
 
     failed_samples: list[str] = []
@@ -1136,31 +1401,68 @@ def load_universe_from_db_cache(config: Config, max_symbols: int | None = None) 
     try:
         ensure_ohlcv_cache_tables(connection, config)
         with connection.cursor() as cursor:
-            params: list[object] = [config.first_pass_min_close, config.first_pass_min_amount]
-            if max_symbols:
-                params.append(max_symbols)
-            cursor.execute(
-                f"""
-                SELECT
-                  m.symbol AS Code,
-                  m.symbol AS Name,
-                  '' AS Sector
-                FROM {meta_table} m
-                INNER JOIN {ohlcv_table} o
-                  ON o.symbol = m.symbol
-                 AND o.trade_date = m.max_trade_date
-                WHERE m.symbol REGEXP '^[0-9]{{6}}$'
-                  AND m.row_count >= 260
-                  AND o.open_price > 0
-                  AND o.high_price > 0
-                  AND o.low_price > 0
-                  AND o.close_price >= %s
-                  AND COALESCE(o.amount, o.close_price * o.volume) >= %s
-                ORDER BY m.max_trade_date DESC, m.symbol
-                {limit_sql}
-                """,
-                tuple(params),
-            )
+            if config.target_date:
+                target_trade_date = expected_latest_trade_date(config_target_datetime(config))
+                params: list[object] = [target_trade_date, target_trade_date, config.first_pass_min_close, config.first_pass_min_amount]
+                if max_symbols:
+                    params.append(max_symbols)
+                cursor.execute(
+                    f"""
+                    SELECT
+                      m.symbol AS Code,
+                      m.symbol AS Name,
+                      '' AS Sector
+                    FROM {meta_table} m
+                    INNER JOIN (
+                      SELECT symbol, MAX(trade_date) AS max_trade_date
+                      FROM {ohlcv_table}
+                      WHERE trade_date <= %s
+                        AND open_price > 0
+                        AND high_price > 0
+                        AND low_price > 0
+                        AND close_price > 0
+                      GROUP BY symbol
+                    ) latest
+                      ON latest.symbol = m.symbol
+                    INNER JOIN {ohlcv_table} o
+                      ON o.symbol = latest.symbol
+                     AND o.trade_date = latest.max_trade_date
+                    WHERE m.symbol REGEXP '^[0-9]{{6}}$'
+                      AND m.row_count >= 260
+                      AND latest.max_trade_date >= %s
+                      AND o.close_price >= %s
+                      AND COALESCE(o.amount, o.close_price * o.volume) >= %s
+                    ORDER BY latest.max_trade_date DESC, m.symbol
+                    {limit_sql}
+                    """,
+                    tuple(params),
+                )
+            else:
+                params = [config.first_pass_min_close, config.first_pass_min_amount]
+                if max_symbols:
+                    params.append(max_symbols)
+                cursor.execute(
+                    f"""
+                    SELECT
+                      m.symbol AS Code,
+                      m.symbol AS Name,
+                      '' AS Sector
+                    FROM {meta_table} m
+                    INNER JOIN {ohlcv_table} o
+                      ON o.symbol = m.symbol
+                     AND o.trade_date = m.max_trade_date
+                    WHERE m.symbol REGEXP '^[0-9]{{6}}$'
+                      AND m.row_count >= 260
+                      AND o.open_price > 0
+                      AND o.high_price > 0
+                      AND o.low_price > 0
+                      AND o.close_price >= %s
+                      AND COALESCE(o.amount, o.close_price * o.volume) >= %s
+                    ORDER BY m.max_trade_date DESC, m.symbol
+                    {limit_sql}
+                    """,
+                    tuple(params),
+                )
             universe = pd.DataFrame(cursor.fetchall())
     finally:
         connection.close()
@@ -1180,6 +1482,10 @@ def load_universe(config: Config, max_symbols: int | None = None) -> pd.DataFram
     Returns:
         Code, Name, Sector 컬럼을 가진 분석 대상 종목 유니버스입니다.
     """
+    if config.target_date:
+        logger.info("target_date 실행: MariaDB OHLCV 캐시 기준으로 분석 유니버스 구성")
+        return load_universe_from_db_cache(config, max_symbols=max_symbols)
+
     try:
         basic = fdr.StockListing("KRX")
     except Exception as exc:  # noqa: BLE001
@@ -1314,8 +1620,9 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
     """
     setup_korean_font()
     start_ts = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
-    now_display = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-    logger.info("마스터 스캐너 시작: %s", now_display)
+    reference_dt = config_target_datetime(config)
+    now_display = reference_dt.strftime("%Y-%m-%d %H:%M:%S")
+    logger.info("마스터 스캐너 시작: %s 기준일=%s", now_display, config.target_date or "-")
 
     stats: Counter = Counter()
     collection_stats = collect_ohlcv_data(config)
@@ -1323,15 +1630,7 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
         stats[f"collection_{key}"] = value
 
     regime = check_market_regime(config)
-    if not regime.ok:
-        regime_msg = f"⚠️ [시장 데이터 경고] 코스닥 지수 조회 실패: {regime.error}\n시장 국면은 '불명'으로 표시하고 스캔은 계속합니다.\n\n"
-    elif not regime.is_bull_market:
-        regime_msg = (
-            f"🛑 [시장 경고] 코스닥 지수({regime.current:,.2f})가 50일선({regime.ma50:,.2f})을 하회합니다.\n"
-            "수익 보전과 현금 비중 확대를 권장합니다.\n\n"
-        )
-    else:
-        regime_msg = ""
+    send_telegram_msg(format_market_regime_message(regime, config), config, dry_run=dry_run)
 
     universe = load_universe(config, max_symbols=max_symbols)
     stats["universe_after_first_filter"] = len(universe)
@@ -1378,7 +1677,8 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
                 sector_warning = f"⚠️ [섹터 집중 경고] 포착된 종목 중 {count}개가 '{top_sector}'에 집중되어 있습니다.\n\n"
 
         intro_msg = (
-            f"{regime_msg}🔔 [퀀트 스캔 결과] 포착 종목: {len(found)}개\n"
+            "📊 [Analysis]\n"
+            f"🔔 [퀀트 스캔 결과] 포착 종목: {len(found)}개\n"
             f"⏰ 스캔 일시: {now_display}\n\n"
             f"{sector_warning}👇 상위 {min(config.top_send_limit, len(found))}개 브리핑을 시작합니다."
         )
@@ -1394,7 +1694,7 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
             send_telegram_msg(build_message(result), config, dry_run=dry_run)
             time.sleep(0.5)
     else:
-        no_result_msg = f"{regime_msg}💡 오늘은 조건을 만족하는 종목이 없습니다."
+        no_result_msg = "📊 [Analysis]\n💡 조건을 만족하는 종목이 없습니다."
         send_telegram_msg(no_result_msg, config, dry_run=dry_run)
         logger.info("조건 만족 종목 없음")
 
@@ -1417,6 +1717,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-refresh", action="store_true", help="OHLCV 캐시 무시")
     parser.add_argument("--no-charts", action="store_true", help="차트 생성/전송 생략")
     parser.add_argument("--no-vcp", action="store_true", help="종합분석 후 VCP 스캔 생략")
+    parser.add_argument("--repair-db-cache", action="store_true", help="invalid OHLCV row 삭제 후 캐시 메타 재계산")
+    parser.add_argument("--target-date", type=parse_target_date, default=None, help="해당 날짜 장마감 기준으로 실행 (YYYY-MM-DD)")
     return parser.parse_args()
 
 
@@ -1428,12 +1730,18 @@ def main() -> int:
     """
     args = parse_args()
     config = Config()
+    if args.target_date:
+        config = replace(config, target_date=args.target_date)
     if args.workers is not None:
         config = replace(config, max_workers=args.workers)
     if args.force_refresh:
         config = replace(config, force_refresh=True)
     if args.no_vcp:
         config = replace(config, vcp_enabled=False)
+    if args.repair_db_cache:
+        result = repair_ohlcv_cache(config)
+        logger.info("OHLCV 캐시 정리 완료: %s", result)
+        return 0
     return run(config, dry_run=args.dry_run, max_symbols=args.max_symbols, no_charts=args.no_charts)
 
 

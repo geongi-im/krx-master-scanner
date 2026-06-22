@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -90,11 +91,54 @@ class VcpScanTest(unittest.TestCase):
 
     def test_has_contracting_swings_uses_configurable_ratio(self):
         """수축폭 감소 기준이 허용 비율 설정을 따르는지 검증합니다."""
-        self.assertTrue(vcp_scan.has_contracting_swings([14.0, 9.0]))
-        self.assertTrue(vcp_scan.has_contracting_swings([18.0, 12.0, 7.0]))
+        self.assertTrue(vcp_scan.has_contracting_swings([14.0, 4.5]))
+        self.assertTrue(vcp_scan.has_contracting_swings([18.0, 8.0, 4.0]))
         self.assertFalse(vcp_scan.has_contracting_swings([9.0]))
-        self.assertFalse(vcp_scan.has_contracting_swings([7.0, 12.0]))
-        self.assertTrue(vcp_scan.has_contracting_swings([10.0, 11.0], max_contraction_ratio=1.15))
+        self.assertFalse(vcp_scan.has_contracting_swings([7.0, 12.0, 4.0]))
+        self.assertFalse(vcp_scan.has_contracting_swings([18.0, 6.0, 5.0]))
+        self.assertFalse(vcp_scan.has_contracting_swings([10.0, 11.0], max_contraction_ratio=1.15))
+
+    def test_volume_dry_up_requires_peak_to_recent_drop_and_declining_phase(self):
+        """거래량 dry-up 기준이 피크 대비 70% 이상 감소와 감소 구간을 함께 요구하는지 검증합니다."""
+        volume = pd.Series([1000] * 20 + [900, 800, 700, 600, 500, 400, 300, 250, 220, 200] + [180] * 20)
+        metrics = vcp_scan.calculate_volume_dry_up(volume, lookback_days=60, window=5)
+
+        self.assertTrue(vcp_scan.has_volume_dry_up(volume, lookback_days=60, window=5, min_dry_up_ratio=0.70))
+        self.assertGreaterEqual(float(metrics["dry_up_ratio"]), 0.70)
+        self.assertTrue(metrics["has_declining_sequence"])
+
+    def test_find_pocket_pivot_points_marks_high_volume_up_days(self):
+        """Pocket Pivot 산출이 전일 대비 상승과 이전 거래량 고점 돌파를 함께 확인하는지 검증합니다."""
+        df = pd.DataFrame(
+            {
+                "Open": [10, 10, 10, 10, 10, 10],
+                "High": [11, 11, 11, 11, 11, 12],
+                "Low": [9, 9, 9, 9, 9, 9],
+                "Close": [10, 10.5, 10.2, 10.6, 10.4, 11.0],
+                "Volume": [100, 120, 110, 115, 125, 200],
+            },
+            index=pd.date_range("2026-01-01", periods=6),
+        )
+
+        pivots = vcp_scan.find_pocket_pivot_points(df, days=3, volume_window=3)
+
+        self.assertEqual(len(pivots), 1)
+        self.assertEqual(pivots.index[0], pd.Timestamp("2026-01-06"))
+
+    def test_run_vcp_engine_passes_target_date_to_bulk_cache_loader(self):
+        """VCP 기준일이 bulk 캐시 조회 종료일로 전달되는지 검증합니다."""
+        universe = pd.DataFrame(columns=["Code", "Name"])
+
+        with (
+            patch.object(vcp_scan, "get_clean_universe", return_value=universe),
+            patch.object(vcp_scan, "load_project_cache_ohlcv_bulk", return_value={}) as load_bulk,
+        ):
+            result = vcp_scan.run_vcp_engine(target_date="2024-06-10", save_charts=False)
+
+        self.assertTrue(result.empty)
+        load_bulk.assert_called_once()
+        self.assertEqual(load_bulk.call_args.args[1].date(), pd.Timestamp("2023-05-07").date())
+        self.assertEqual(load_bulk.call_args.kwargs["end_date"].date(), pd.Timestamp("2024-06-10").date())
 
     def test_validate_vcp_criteria_rejects_invalid_windows(self):
         """VCP 기준값 검증이 잘못된 기간 설정을 차단하는지 확인합니다."""

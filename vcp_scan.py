@@ -57,6 +57,10 @@ warnings.filterwarnings("ignore")
 MAX_DROP_FROM_HIGH = 0.18
 MAX_PIVOT_GAP = 0.15
 MIN_CONTRACTION_SEGMENTS = 2
+MAX_FINAL_CONTRACTION_PCT = 5.0
+VOLUME_DRY_UP_LOOKBACK_DAYS = 120
+VOLUME_DRY_UP_WINDOW = 10
+MIN_VOLUME_DRY_UP_RATIO = 0.70
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CHARTS_DIR = APP_DIR / "data" / "charts"
 CHART_RETENTION_DAYS = 3
@@ -88,8 +92,12 @@ class VcpCriteria:
     max_pivot_gap: float = MAX_PIVOT_GAP
     min_contraction_segments: int = MIN_CONTRACTION_SEGMENTS
     max_contraction_ratio: float = 1.0
+    max_final_contraction_pct: float = MAX_FINAL_CONTRACTION_PCT
     high_window: int = 252
     recent_high_window: int = 20
+    volume_dry_up_lookback_days: int = VOLUME_DRY_UP_LOOKBACK_DAYS
+    volume_dry_up_window: int = VOLUME_DRY_UP_WINDOW
+    min_volume_dry_up_ratio: float = MIN_VOLUME_DRY_UP_RATIO
     fast_ma_window: int = 20
     mid_ma_window: int = 50
     long_ma_window: int = 150
@@ -168,6 +176,19 @@ def sanitize_json_value(value: object) -> object:
     if isinstance(value, numbers.Real):
         return float(value) if math.isfinite(float(value)) else None
     return value
+
+
+def resolve_target_datetime(target_date: str | datetime | None) -> datetime:
+    """VCP 실행 기준일을 datetime으로 변환합니다."""
+    if target_date is None:
+        return datetime.today()
+    try:
+        parsed = pd.Timestamp(target_date)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("target_date는 YYYY-MM-DD 형식이어야 합니다.") from exc
+    if pd.isna(parsed):
+        raise ValueError("target_date는 YYYY-MM-DD 형식이어야 합니다.")
+    return parsed.to_pydatetime()
 
 
 def find_peaks(values: list[float], distance: int = 1) -> list[int]:
@@ -363,6 +384,7 @@ def save_vcp_chart(
     vcp_stage: str,
     drop_pct: float,
     swing_segments: list[dict[str, object]],
+    pocket_pivot_points: pd.DataFrame | None = None,
     output_dir: Path,
     high_window: int = 252,
 ) -> Path:
@@ -375,6 +397,7 @@ def save_vcp_chart(
         vcp_stage: VCP 단계 라벨입니다.
         drop_pct: 52주 고점 대비 하락률입니다.
         swing_segments: 차트에 표시할 수축 구간 목록입니다.
+        pocket_pivot_points: 차트에 표시할 Pocket Pivot 발생일 목록입니다.
         output_dir: 차트 이미지를 저장할 디렉터리입니다.
 
     Returns:
@@ -465,6 +488,52 @@ def save_vcp_chart(
             fontweight="bold",
             bbox={"boxstyle": "round,pad=0.2", "facecolor": "#fff6ba", "edgecolor": "none", "alpha": 0.85},
         )
+
+    if pocket_pivot_points is not None and not pocket_pivot_points.empty:
+        visible_pivots = pocket_pivot_points.copy()
+        visible_pivots.index = pd.to_datetime(visible_pivots.index)
+        visible_pivots = visible_pivots[visible_pivots.index.isin(recent.index)]
+        if not visible_pivots.empty:
+            price_range = max(float(recent["High"].max() - recent["Low"].min()), 1.0)
+            ax_price.scatter([], [], marker="^", s=70, color="#6f2dbd", edgecolors="white", linewidths=0.7, label="Pocket Pivot")
+            for pivot_date, pivot_row in visible_pivots.iterrows():
+                pivot_x = date_to_pos[pd.Timestamp(pivot_date)]
+                pivot_high = float(pivot_row["High"])
+                pivot_volume = float(pivot_row["Volume"]) / 1_000_000
+                marker_y = pivot_high + price_range * 0.035
+
+                ax_price.scatter(
+                    pivot_x,
+                    marker_y,
+                    marker="^",
+                    s=70,
+                    color="#6f2dbd",
+                    edgecolors="white",
+                    linewidths=0.7,
+                    zorder=6,
+                )
+                ax_price.annotate(
+                    "PP",
+                    xy=(pivot_x, marker_y),
+                    xytext=(0, 8),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    color="#4c1d95",
+                    fontsize=9,
+                    fontweight="bold",
+                )
+                ax_volume.scatter(
+                    pivot_x,
+                    pivot_volume,
+                    marker="^",
+                    s=58,
+                    color="#6f2dbd",
+                    edgecolors="white",
+                    linewidths=0.7,
+                    zorder=5,
+                )
+            ax_price.legend(loc="upper left", fontsize=8, frameon=True)
 
     stage_label = vcp_stage.split()[0]
     ax_price.set_title(f"[VCP {stage_label}] {name} ({symbol}) - 신고가까지 {drop_pct:.2f}%", fontsize=15, fontweight="bold", pad=14)
@@ -560,6 +629,8 @@ def validate_vcp_criteria(criteria: VcpCriteria) -> None:
     window_values = {
         "high_window": criteria.high_window,
         "recent_high_window": criteria.recent_high_window,
+        "volume_dry_up_lookback_days": criteria.volume_dry_up_lookback_days,
+        "volume_dry_up_window": criteria.volume_dry_up_window,
         "fast_ma_window": criteria.fast_ma_window,
         "mid_ma_window": criteria.mid_ma_window,
         "long_ma_window": criteria.long_ma_window,
@@ -578,6 +649,10 @@ def validate_vcp_criteria(criteria: VcpCriteria) -> None:
         raise ValueError("VCP 최소 수축 구간 수는 1 이상이어야 합니다.")
     if criteria.max_contraction_ratio <= 0:
         raise ValueError("VCP 수축 비율 기준은 0보다 커야 합니다.")
+    if criteria.max_final_contraction_pct <= 0:
+        raise ValueError("VCP 최종 수축폭 기준은 0보다 커야 합니다.")
+    if criteria.min_volume_dry_up_ratio < 0 or criteria.min_volume_dry_up_ratio > 1:
+        raise ValueError("VCP 거래량 감소율 기준은 0 이상 1 이하이어야 합니다.")
     if criteria.min_pocket_pivot_count < 0:
         raise ValueError("VCP Pocket Pivot 최소 횟수는 0 이상이어야 합니다.")
 
@@ -618,19 +693,126 @@ def has_contracting_swings(
     *,
     min_segments: int = MIN_CONTRACTION_SEGMENTS,
     max_contraction_ratio: float = 1.0,
+    max_final_contraction_pct: float = MAX_FINAL_CONTRACTION_PCT,
 ) -> bool:
     """최근 VCP 수축폭이 실제로 감소하는지 확인합니다.
 
     Args:
         swing_drops: 최근 고점-저점 구간별 하락률 목록입니다.
+        min_segments: 필요한 최소 수축 구간 수입니다.
+        max_contraction_ratio: 직전 수축폭 대비 허용되는 최대 비율입니다.
+        max_final_contraction_pct: 마지막 수축폭의 최대 허용값입니다.
 
     Returns:
-        최소 수축 구간 수를 만족하고 마지막 수축폭이 이전 수축폭보다 작으면 True입니다.
+        최소 수축 구간 수를 만족하고 최근 수축폭이 점차 작아지면 True입니다.
     """
     if len(swing_drops) < min_segments:
         return False
-    recent = swing_drops[-3:]
-    return recent[-1] <= recent[-2] * max_contraction_ratio
+
+    recent_count = min(len(swing_drops), max(min_segments, 3))
+    recent = swing_drops[-recent_count:]
+    if recent[-1] >= max_final_contraction_pct:
+        return False
+
+    for previous_drop, current_drop in zip(recent, recent[1:]):
+        if current_drop >= previous_drop:
+            return False
+        if current_drop > previous_drop * max_contraction_ratio:
+            return False
+    return True
+
+
+def calculate_volume_dry_up(
+    volume: pd.Series,
+    *,
+    lookback_days: int = VOLUME_DRY_UP_LOOKBACK_DAYS,
+    window: int = VOLUME_DRY_UP_WINDOW,
+) -> dict[str, object]:
+    """거래량이 피크 이후 충분히 말랐는지 판단할 기초 지표를 계산합니다.
+
+    Args:
+        volume: 거래량 시계열입니다.
+        lookback_days: 거래량 dry-up을 볼 최근 기간입니다.
+        window: 거래량 평균을 계산할 기간입니다.
+
+    Returns:
+        피크 평균 거래량, 최근 평균 거래량, 감소율, 감소 구간 존재 여부입니다.
+    """
+    clean_volume = pd.to_numeric(volume.tail(lookback_days), errors="coerce").dropna()
+    if len(clean_volume) < window * 2:
+        return {
+            "peak_avg_volume": None,
+            "recent_avg_volume": None,
+            "dry_up_ratio": None,
+            "has_declining_sequence": False,
+        }
+
+    rolling_volume = clean_volume.rolling(window=window).mean().dropna()
+    if len(rolling_volume) < 2:
+        return {
+            "peak_avg_volume": None,
+            "recent_avg_volume": None,
+            "dry_up_ratio": None,
+            "has_declining_sequence": False,
+        }
+
+    peak_position = int(rolling_volume.to_numpy().argmax())
+    peak_avg = float(rolling_volume.iloc[peak_position])
+    recent_avg = float(rolling_volume.iloc[-1])
+    if peak_avg <= 0:
+        dry_up_ratio = None
+    else:
+        dry_up_ratio = (peak_avg - recent_avg) / peak_avg
+
+    after_peak = rolling_volume.iloc[peak_position:]
+    after_peak_values = [float(value) for value in after_peak]
+    has_declining_sequence = False
+    for start_idx in range(0, max(len(after_peak_values) - 2, 0)):
+        window_values = after_peak_values[start_idx : start_idx + 3]
+        if window_values[0] > window_values[1] > window_values[2]:
+            has_declining_sequence = True
+            break
+
+    return {
+        "peak_avg_volume": peak_avg,
+        "recent_avg_volume": recent_avg,
+        "dry_up_ratio": dry_up_ratio,
+        "has_declining_sequence": has_declining_sequence,
+    }
+
+
+def has_volume_dry_up(
+    volume: pd.Series,
+    *,
+    lookback_days: int = VOLUME_DRY_UP_LOOKBACK_DAYS,
+    window: int = VOLUME_DRY_UP_WINDOW,
+    min_dry_up_ratio: float = MIN_VOLUME_DRY_UP_RATIO,
+) -> bool:
+    """거래량이 피크 대비 충분히 줄고 감소 구간을 만들었는지 확인합니다."""
+    metrics = calculate_volume_dry_up(volume, lookback_days=lookback_days, window=window)
+    dry_up_ratio = metrics["dry_up_ratio"]
+    return (
+        dry_up_ratio is not None
+        and float(dry_up_ratio) >= min_dry_up_ratio
+        and bool(metrics["has_declining_sequence"])
+    )
+
+
+def find_pocket_pivot_points(
+    df: pd.DataFrame,
+    *,
+    days: int,
+    volume_window: int,
+) -> pd.DataFrame:
+    """최근 기간에서 Pocket Pivot 발생일을 찾습니다."""
+    pivot_df = df.copy()
+    pivot_df["Prev_Close"] = pivot_df["Close"].shift(1)
+    pivot_df["Max_Volume_Window"] = pivot_df["Volume"].shift(1).rolling(window=volume_window).max()
+    recent_window = pivot_df.iloc[-days:]
+    return recent_window[
+        (recent_window["Close"] > recent_window["Prev_Close"])
+        & (recent_window["Volume"] > recent_window["Max_Volume_Window"])
+    ]
 
 
 def fetch_ohlcv_data(
@@ -638,6 +820,7 @@ def fetch_ohlcv_data(
     *,
     start_date: datetime,
     end_date: datetime,
+    limit_end_date: bool = True,
     use_project_cache: bool,
     force_refresh: bool,
 ) -> pd.DataFrame:
@@ -647,6 +830,7 @@ def fetch_ohlcv_data(
         symbol: 종목 코드입니다.
         start_date: 조회 시작일입니다.
         end_date: 조회 종료일입니다.
+        limit_end_date: 프로젝트 캐시 조회에도 종료일을 강제할지 여부입니다.
         use_project_cache: 프로젝트 MariaDB 캐시를 사용할지 여부입니다.
         force_refresh: 캐시를 무시하고 새로 조회할지 여부입니다.
 
@@ -657,7 +841,12 @@ def fetch_ohlcv_data(
         project_main = runtime()
 
         config = project_main.Config(force_refresh=force_refresh)
-        return project_main.fetch_ohlcv(symbol, start_date.strftime("%Y-%m-%d"), config)
+        return project_main.fetch_ohlcv(
+            symbol,
+            start_date.strftime("%Y-%m-%d"),
+            config,
+            end_date=end_date.strftime("%Y-%m-%d") if limit_end_date else None,
+        )
 
     return fdr.DataReader(symbol, start_date, end_date)
 
@@ -711,12 +900,13 @@ def bulk_rows_to_ohlcv_groups(rows: list[dict[str, object]]) -> dict[str, pd.Dat
     return groups
 
 
-def load_project_cache_ohlcv_bulk(universe: pd.DataFrame, start_date: datetime) -> dict[str, pd.DataFrame]:
+def load_project_cache_ohlcv_bulk(universe: pd.DataFrame, start_date: datetime, *, end_date: datetime | None = None) -> dict[str, pd.DataFrame]:
     """VCP 스캔 대상 OHLCV를 MariaDB에서 bulk로 한 번에 조회합니다.
 
     Args:
         universe: `Code` 컬럼을 가진 VCP 스캔 대상 종목 목록입니다.
         start_date: 조회 시작일입니다.
+        end_date: 조회 종료일입니다. None이면 종료일 제한이 없습니다.
 
     Returns:
         종목 코드를 키로 하고 OHLCV 데이터프레임을 값으로 갖는 딕셔너리입니다.
@@ -738,6 +928,12 @@ def load_project_cache_ohlcv_bulk(universe: pd.DataFrame, start_date: datetime) 
             for offset in range(0, len(symbols), chunk_size):
                 chunk = symbols[offset : offset + chunk_size]
                 placeholders = ", ".join(["%s"] * len(chunk))
+                end_filter_sql = "AND trade_date <= %s" if end_date is not None else ""
+                params: tuple[object, ...]
+                if end_date is not None:
+                    params = (*chunk, start_date.date(), end_date.date())
+                else:
+                    params = (*chunk, start_date.date())
                 cursor.execute(
                     f"""
                     SELECT
@@ -753,13 +949,14 @@ def load_project_cache_ohlcv_bulk(universe: pd.DataFrame, start_date: datetime) 
                     FROM {ohlcv_table}
                     WHERE symbol IN ({placeholders})
                       AND trade_date >= %s
+                      {end_filter_sql}
                       AND open_price > 0
                       AND high_price > 0
                       AND low_price > 0
                       AND close_price > 0
                     ORDER BY symbol, trade_date
                     """,
-                    (*chunk, start_date.date()),
+                    params,
                 )
                 groups.update(bulk_rows_to_ohlcv_groups(list(cursor.fetchall())))
     finally:
@@ -774,6 +971,7 @@ def generate_symbol_chart(
     *,
     name: str | None,
     days: int,
+    target_date: str | None,
     charts_dir: Path,
     use_project_cache: bool,
     force_refresh: bool,
@@ -784,6 +982,7 @@ def generate_symbol_chart(
         symbol: 종목 코드입니다.
         name: 차트에 표시할 종목명입니다. None이면 조회합니다.
         days: 조회할 과거 일수입니다.
+        target_date: 차트 생성 기준일입니다. None이면 현재 기준입니다.
         charts_dir: 차트를 저장할 디렉터리입니다.
         use_project_cache: 프로젝트 MariaDB 캐시를 사용할지 여부입니다.
         force_refresh: 캐시를 무시하고 새로 조회할지 여부입니다.
@@ -794,12 +993,13 @@ def generate_symbol_chart(
     Raises:
         ValueError: 차트 생성에 필요한 OHLCV 데이터가 부족한 경우 발생합니다.
     """
-    end_date = datetime.today()
+    end_date = resolve_target_datetime(target_date)
     start_date = end_date - timedelta(days=days)
     df = fetch_ohlcv_data(
         symbol,
         start_date=start_date,
         end_date=end_date,
+        limit_end_date=target_date is not None,
         use_project_cache=use_project_cache,
         force_refresh=force_refresh,
     )
@@ -811,6 +1011,7 @@ def generate_symbol_chart(
     drop_pct = ((high_52w - current_price) / high_52w * 100) if high_52w else 0.0
     vcp_stage = classify_vcp_stage(drop_pct)
     swing_segments = calculate_swing_segments(df["Close"])
+    pocket_pivot_points = find_pocket_pivot_points(df, days=14, volume_window=10)
 
     return save_vcp_chart(
         df,
@@ -819,6 +1020,7 @@ def generate_symbol_chart(
         vcp_stage=vcp_stage,
         drop_pct=drop_pct,
         swing_segments=swing_segments,
+        pocket_pivot_points=pocket_pivot_points,
         output_dir=charts_dir,
     )
 
@@ -831,6 +1033,7 @@ def run_vcp_engine(
     max_pivot_gap: float = MAX_PIVOT_GAP,
     criteria: VcpCriteria | None = None,
     days: int = 400,
+    target_date: str | None = None,
     save_charts: bool = True,
     charts_dir: Path | None = None,
     use_project_cache: bool = True,
@@ -842,6 +1045,7 @@ def run_vcp_engine(
         max_symbols: 테스트용 최대 종목 수입니다.
         min_avg_traded_value: 20일 평균 거래대금 최소 기준입니다.
         days: 조회할 과거 일수입니다.
+        target_date: VCP 계산 기준일입니다. None이면 현재 기준입니다.
         save_charts: 후보 차트 이미지를 저장할지 여부입니다.
         charts_dir: 차트 이미지를 저장할 디렉터리입니다.
         use_project_cache: 프로젝트 MariaDB 캐시를 사용할지 여부입니다.
@@ -860,11 +1064,11 @@ def run_vcp_engine(
 
     universe = get_clean_universe(max_symbols=max_symbols)
 
-    end_date = datetime.today()
+    end_date = resolve_target_datetime(target_date)
     start_date = end_date - timedelta(days=days)
     bulk_ohlcv_by_symbol: dict[str, pd.DataFrame] | None = None
     if use_project_cache and not force_refresh:
-        bulk_ohlcv_by_symbol = load_project_cache_ohlcv_bulk(universe, start_date)
+        bulk_ohlcv_by_symbol = load_project_cache_ohlcv_bulk(universe, start_date, end_date=end_date)
 
     vcp_candidates: list[dict[str, object]] = []
 
@@ -881,6 +1085,7 @@ def run_vcp_engine(
                     symbol,
                     start_date=start_date,
                     end_date=end_date,
+                    limit_end_date=target_date is not None,
                     use_project_cache=use_project_cache,
                     force_refresh=force_refresh,
                 )
@@ -944,6 +1149,20 @@ def run_vcp_engine(
                 swing_drops,
                 min_segments=criteria.min_contraction_segments,
                 max_contraction_ratio=criteria.max_contraction_ratio,
+                max_final_contraction_pct=criteria.max_final_contraction_pct,
+            ):
+                continue
+
+            volume_dry_up = calculate_volume_dry_up(
+                df["Volume"],
+                lookback_days=criteria.volume_dry_up_lookback_days,
+                window=criteria.volume_dry_up_window,
+            )
+            dry_up_ratio = volume_dry_up["dry_up_ratio"]
+            if (
+                dry_up_ratio is None
+                or float(dry_up_ratio) < criteria.min_volume_dry_up_ratio
+                or not bool(volume_dry_up["has_declining_sequence"])
             ):
                 continue
 
@@ -954,14 +1173,12 @@ def run_vcp_engine(
             if not is_finite_number(pivot_gap) or pivot_gap > criteria.max_pivot_gap:
                 continue
 
-            df["Prev_Close"] = df["Close"].shift(1)
-            df["Max_Volume_Window"] = df["Volume"].shift(1).rolling(window=criteria.pocket_volume_window).max()
-            recent_pocket_window = df.iloc[-criteria.pocket_pivot_days :]
-            pocket_pivot_days = recent_pocket_window[
-                (recent_pocket_window["Close"] > recent_pocket_window["Prev_Close"])
-                & (recent_pocket_window["Volume"] > recent_pocket_window["Max_Volume_Window"])
-            ]
-            if len(pocket_pivot_days) < criteria.min_pocket_pivot_count:
+            pocket_pivot_points = find_pocket_pivot_points(
+                df,
+                days=criteria.pocket_pivot_days,
+                volume_window=criteria.pocket_volume_window,
+            )
+            if len(pocket_pivot_points) < criteria.min_pocket_pivot_count:
                 continue
 
             display_name = resolve_symbol_name(str(symbol), name)
@@ -978,6 +1195,7 @@ def run_vcp_engine(
                         vcp_stage=vcp_stage,
                         drop_pct=drop_pct,
                         swing_segments=swing_segments,
+                        pocket_pivot_points=pocket_pivot_points,
                         output_dir=charts_dir,
                         high_window=criteria.high_window,
                     )
@@ -991,11 +1209,15 @@ def run_vcp_engine(
                     "drop_from_52w_high_pct": round(drop_pct, 2),
                     "vcp_stage": vcp_stage,
                     "recent_swing_drops_pct": swing_drops,
-                    "pocket_pivot_count": len(pocket_pivot_days),
-                    "pocket_pivot_count_14d": len(pocket_pivot_days),
+                    "pocket_pivot_count": len(pocket_pivot_points),
+                    "pocket_pivot_count_14d": len(pocket_pivot_points),
                     "avg_traded_value_20": int(avg_traded_value_20),
                     "pivot_gap_pct": round(pivot_gap * 100, 2),
                     "contraction_ratio": round(contraction_ratio, 3) if contraction_ratio is not None else None,
+                    "final_contraction_pct": round(swing_drops[-1], 2) if swing_drops else None,
+                    "volume_dry_up_pct": round(float(dry_up_ratio) * 100, 2),
+                    "volume_peak_avg": int(float(volume_dry_up["peak_avg_volume"] or 0)),
+                    "recent_volume_avg": int(float(volume_dry_up["recent_avg_volume"] or 0)),
                     "price_vs_fast_ma_pct": round((current_price / sma_fast - 1) * 100, 2) if sma_fast else None,
                     "price_vs_mid_ma_pct": round((current_price / sma_mid - 1) * 100, 2) if sma_mid else None,
                     "recent_high_window": criteria.recent_high_window,
@@ -1117,6 +1339,7 @@ def run_vcp_scan(
     max_pivot_gap: float = MAX_PIVOT_GAP,
     criteria: VcpCriteria | None = None,
     days: int = 400,
+    target_date: str | None = None,
     save_charts: bool = True,
     charts_dir: Path | None = None,
     use_project_cache: bool = True,
@@ -1128,6 +1351,7 @@ def run_vcp_scan(
         max_symbols: 테스트용 최대 종목 수입니다.
         min_avg_traded_value: 20일 평균 거래대금 최소 기준입니다.
         days: 조회할 과거 일수입니다.
+        target_date: VCP 계산 기준일입니다. None이면 현재 기준입니다.
         save_charts: 후보 차트 이미지를 저장할지 여부입니다.
         charts_dir: 차트 이미지를 저장할 디렉터리입니다.
         use_project_cache: 프로젝트 MariaDB 캐시를 사용할지 여부입니다.
@@ -1150,6 +1374,7 @@ def run_vcp_scan(
         max_symbols=max_symbols,
         criteria=criteria,
         days=days,
+        target_date=target_date,
         save_charts=save_charts,
         charts_dir=charts_dir,
         use_project_cache=use_project_cache,
@@ -1166,6 +1391,7 @@ def run_vcp_scan(
             "max_symbols": max_symbols,
             "criteria": asdict(criteria),
             "days": days,
+            "target_date": target_date,
             "save_charts": save_charts,
             "use_project_cache": use_project_cache,
             "force_refresh": force_refresh,
@@ -1185,6 +1411,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", type=str, default=None, help="Generate one real-data chart for this stock code.")
     parser.add_argument("--name", type=str, default=None, help="Display name for --symbol chart.")
     parser.add_argument("--days", type=int, default=400, help="Historical calendar days to request.")
+    parser.add_argument("--target-date", type=str, default=None, help="Run as of this date after market close (YYYY-MM-DD).")
     parser.add_argument(
         "--min-avg-traded-value",
         type=int,
@@ -1205,8 +1432,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-contraction-segments", type=int, default=MIN_CONTRACTION_SEGMENTS)
     parser.add_argument("--max-contraction-ratio", type=float, default=1.0)
+    parser.add_argument("--max-final-contraction-pct", type=float, default=MAX_FINAL_CONTRACTION_PCT)
     parser.add_argument("--high-window", type=int, default=252)
     parser.add_argument("--recent-high-window", type=int, default=20)
+    parser.add_argument("--volume-dry-up-lookback-days", type=int, default=VOLUME_DRY_UP_LOOKBACK_DAYS)
+    parser.add_argument("--volume-dry-up-window", type=int, default=VOLUME_DRY_UP_WINDOW)
+    parser.add_argument("--min-volume-dry-up-ratio", type=float, default=MIN_VOLUME_DRY_UP_RATIO)
     parser.add_argument("--fast-ma-window", type=int, default=20)
     parser.add_argument("--mid-ma-window", type=int, default=50)
     parser.add_argument("--long-ma-window", type=int, default=150)
@@ -1242,6 +1473,7 @@ def main() -> int:
             args.symbol,
             name=args.name,
             days=args.days,
+            target_date=args.target_date,
             charts_dir=args.charts_dir,
             use_project_cache=not args.no_project_cache,
             force_refresh=args.force_refresh,
@@ -1256,8 +1488,12 @@ def main() -> int:
         max_pivot_gap=args.max_pivot_gap,
         min_contraction_segments=args.min_contraction_segments,
         max_contraction_ratio=args.max_contraction_ratio,
+        max_final_contraction_pct=args.max_final_contraction_pct,
         high_window=args.high_window,
         recent_high_window=args.recent_high_window,
+        volume_dry_up_lookback_days=args.volume_dry_up_lookback_days,
+        volume_dry_up_window=args.volume_dry_up_window,
+        min_volume_dry_up_ratio=args.min_volume_dry_up_ratio,
         fast_ma_window=args.fast_ma_window,
         mid_ma_window=args.mid_ma_window,
         long_ma_window=args.long_ma_window,
@@ -1273,6 +1509,7 @@ def main() -> int:
         max_symbols=args.max_symbols,
         criteria=criteria,
         days=args.days,
+        target_date=args.target_date,
         save_charts=not args.no_charts,
         charts_dir=args.charts_dir,
         use_project_cache=not args.no_project_cache,

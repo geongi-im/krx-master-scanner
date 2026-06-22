@@ -98,7 +98,7 @@ def check_market_regime(config: Any) -> MarketRegime:
         시장 데이터 조회 성공 여부와 50일선 기준 강세장 여부입니다.
     """
     project_main = runtime()
-    start_date = (datetime.now(project_main.KST) - timedelta(days=150)).strftime("%Y-%m-%d")
+    start_date = project_main.window_start_date(config, 150)
     try:
         df = project_main.fetch_ohlcv("KQ11", start_date, config)
         if len(df) < 60:
@@ -176,7 +176,7 @@ def get_stock_details(code: str, name: str, config: Any) -> str:
     project_main = runtime()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36"}
     supply_summary = "🤝 [수급 현황] 정보 없음"
-    today = datetime.now(project_main.KST).replace(tzinfo=None)
+    today = project_main.config_target_datetime(config).replace(tzinfo=None)
     one_month_ago = today - timedelta(days=30)
 
     try:
@@ -217,26 +217,27 @@ def get_stock_details(code: str, name: str, config: Any) -> str:
             if title_tag and date_tag:
                 try:
                     news_date = datetime.strptime(date_tag.text.strip(), "%Y.%m.%d %H:%M")
-                    if news_date >= one_month_ago:
+                    if one_month_ago <= news_date <= today:
                         valid_news.append(f"[네이버] {title_tag.text.strip()}")
                 except ValueError:
                     continue
     except Exception as exc:  # noqa: BLE001
         logger.info("네이버 뉴스 조회 실패: %s %s", code, exc)
 
-    try:
-        encoded_query = quote(f'"{name} 특징주" OR "{name} 주식"')
-        google_rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
-        res_google = requests.get(google_rss_url, timeout=config.request_timeout)
-        res_google.raise_for_status()
-        root = ET.fromstring(res_google.text)
-        for item in root.findall(".//item")[:3]:
-            title_node = item.find("title")
-            if title_node is not None and title_node.text:
-                clean_title = title_node.text.rsplit(" - ", 1)[0]
-                valid_news.append(f"[구글] {clean_title}")
-    except Exception as exc:  # noqa: BLE001
-        logger.info("구글 뉴스 조회 실패: %s %s", code, exc)
+    if not getattr(config, "target_date", None):
+        try:
+            encoded_query = quote(f'"{name} 특징주" OR "{name} 주식"')
+            google_rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
+            res_google = requests.get(google_rss_url, timeout=config.request_timeout)
+            res_google.raise_for_status()
+            root = ET.fromstring(res_google.text)
+            for item in root.findall(".//item")[:3]:
+                title_node = item.find("title")
+                if title_node is not None and title_node.text:
+                    clean_title = title_node.text.rsplit(" - ", 1)[0]
+                    valid_news.append(f"[구글] {clean_title}")
+        except Exception as exc:  # noqa: BLE001
+            logger.info("구글 뉴스 조회 실패: %s %s", code, exc)
 
     if valid_news:
         unique_news = list(dict.fromkeys(valid_news))[:5]
@@ -260,7 +261,7 @@ def analyze_stock(stock_info: tuple[str, str, str], kq_return_60: float, config:
     """
     project_main = runtime()
     code, name, sector = stock_info
-    start_date = (datetime.now(project_main.KST) - timedelta(days=600)).strftime("%Y-%m-%d")
+    start_date = project_main.window_start_date(config, 600)
 
     try:
         df = project_main.fetch_ohlcv(code, start_date, config)
@@ -461,7 +462,7 @@ def generate_chart(code: str, name: str, entry_p: float, target_p: float, stop_p
     """
     project_main = runtime()
     try:
-        start_date = (datetime.now(project_main.KST) - timedelta(days=120)).strftime("%Y-%m-%d")
+        start_date = project_main.window_start_date(config, 120)
         df = project_main.fetch_ohlcv(code, start_date, config)
         if len(df) < 20:
             return None
@@ -518,6 +519,7 @@ def build_message(stock: ScanResult) -> str:
     """
     sector = stock.sector if str(stock.sector).lower() != "nan" and stock.sector else "기타"
     return (
+        "📊 [Analysis 후보]\n"
         f"{stock.star_icon} [정통 셋업] {stock.name}({stock.code}) - {sector}\n"
         f"💰 현재가: {stock.curr_p:,.0f}원 (수렴 돌파: {stock.breakout_pct:+.1f}%)\n"
         f"📈 깃대: +{(stock.pole_ratio - 1) * 100:.0f}% | 🎌 수렴: {stock.flag_depth * 100:.1f}%\n"

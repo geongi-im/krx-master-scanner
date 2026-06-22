@@ -105,6 +105,21 @@ class OhlcvCacheTest(unittest.TestCase):
         self.assertEqual(result.index.min(), pd.Timestamp("2024-01-01"))
         self.assertEqual(result.index.max(), pd.Timestamp("2024-01-12"))
 
+    def test_fetch_ohlcv_respects_explicit_end_date(self):
+        """기준일 실행 시 FDR 종료일과 반환 데이터 상한을 함께 적용하는지 검증합니다."""
+        fetched = self.frame("2024-01-01", 5).drop(columns=["Amount", "AmountSource"])
+
+        with (
+            patch.object(main, "read_cached_ohlcv", return_value=None),
+            patch.object(main.fdr, "DataReader", return_value=fetched) as data_reader,
+            patch.object(main, "write_cached_ohlcv"),
+        ):
+            result = main.fetch_ohlcv("005930", "2024-01-01", self.config, end_date="2024-01-03")
+
+        data_reader.assert_called_once_with("005930", "2024-01-01", "2024-01-03")
+        self.assertEqual(result.index.min(), pd.Timestamp("2024-01-01"))
+        self.assertEqual(result.index.max(), pd.Timestamp("2024-01-03"))
+
     def test_fetch_ohlcv_falls_back_to_db_cache_when_incremental_refresh_fails(self):
         """증분 갱신 실패 시 기존 DB 캐시를 fallback으로 반환하는지 검증합니다."""
         cached = self.frame("2024-01-01", 5)
@@ -152,6 +167,44 @@ class OhlcvCacheTest(unittest.TestCase):
         self.assertEqual(df["Amount"].iloc[0], 105000)
         self.assertEqual(df["AmountSource"].iloc[0], "computed")
 
+    def test_rebuild_ohlcv_cache_meta_uses_valid_rows_from_db(self):
+        """캐시 메타가 전달받은 부분 데이터가 아니라 DB의 유효 row 기준으로 재계산되는지 검증합니다."""
+
+        class FakeCursor:
+            def __init__(self):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, sql, params=()):
+                self.calls.append((sql, params))
+
+            def fetchone(self):
+                return {"symbol_count": 1}
+
+        class FakeConnection:
+            def __init__(self):
+                self.cursor_obj = FakeCursor()
+
+            def cursor(self):
+                return self.cursor_obj
+
+        connection = FakeConnection()
+
+        updated = main.rebuild_ohlcv_cache_meta(connection, self.config, symbol="005930")
+
+        self.assertEqual(updated, 1)
+        executed_sql = "\n".join(sql for sql, _ in connection.cursor_obj.calls)
+        self.assertIn("COUNT(DISTINCT symbol)", executed_sql)
+        self.assertIn("SELECT\n              symbol,\n              MIN(trade_date)", executed_sql)
+        self.assertIn("open_price > 0", executed_sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", executed_sql)
+        self.assertEqual(connection.cursor_obj.calls[0][1], ("005930",))
+
     def test_expected_latest_trade_date_handles_weekend_and_intraday_runs(self):
         """기대 최신 거래일이 주말과 장중 실행 시각을 고려하는지 검증합니다."""
         self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 20, 10, 0)), date(2026, 6, 19))
@@ -195,6 +248,50 @@ class OhlcvCacheTest(unittest.TestCase):
         self.assertEqual(stats["targets_total"], 3)
         self.assertEqual(stats["status_collected"], 3)
 
+    def test_collect_ohlcv_data_uses_target_date_for_start_dates(self):
+        """기준일 실행 시 전체 수집 시작일이 현재일이 아니라 기준일에서 계산되는지 검증합니다."""
+        config = main.Config(max_workers=1, collect_days=10, target_date="2024-06-10")
+        universe = pd.DataFrame([{"Code": "000080", "Name": "A", "Sector": ""}])
+        calls = []
+
+        def fake_fetch(symbol, start_date, fetch_config):
+            calls.append((symbol, start_date, fetch_config.target_date))
+            return self.frame("2024-01-01", 2)
+
+        with (
+            patch.object(main, "get_target_date_cache_status", return_value={"is_ready": False, "reason": "cache miss"}),
+            patch.object(main, "load_collection_universe", return_value=universe),
+            patch.object(main, "fetch_ohlcv", side_effect=fake_fetch),
+        ):
+            main.collect_ohlcv_data(config)
+
+        self.assertEqual(calls, [("KQ11", "2024-01-12", "2024-06-10"), ("000080", "2024-05-31", "2024-06-10")])
+
+    def test_collect_ohlcv_data_skips_collection_when_target_cache_is_ready(self):
+        """target_date 데이터가 DB에 충분하면 전체 수집 루프를 생략하는지 검증합니다."""
+        config = main.Config(max_workers=1, collect_days=10, target_date="2024-06-10")
+        cache_status = {
+            "is_ready": True,
+            "target_trade_date": date(2024, 6, 10),
+            "index_ready": True,
+            "eligible_stocks": 1300,
+            "ready_stocks": 1250,
+            "coverage_ratio": 1250 / 1300,
+        }
+
+        with (
+            patch.object(main, "get_target_date_cache_status", return_value=cache_status),
+            patch.object(main, "load_collection_universe") as load_collection_universe,
+            patch.object(main, "fetch_ohlcv") as fetch_ohlcv,
+        ):
+            stats = main.collect_ohlcv_data(config)
+
+        load_collection_universe.assert_not_called()
+        fetch_ohlcv.assert_not_called()
+        self.assertEqual(stats["collection_skipped_target_cache_ready"], 1)
+        self.assertEqual(stats["status_cache_ready"], 1251)
+        self.assertEqual(stats["latest_2024-06-10"], 1251)
+
     def test_run_collects_all_data_before_limited_analysis(self):
         """분석용 max_symbols가 전체 수집 단계에 전달되지 않는지 검증합니다."""
         config = main.Config(max_workers=1)
@@ -216,6 +313,44 @@ class OhlcvCacheTest(unittest.TestCase):
         collect.assert_called_once_with(config)
         load_universe.assert_called_once_with(config, max_symbols=2)
         run_vcp.assert_called_once_with(config, dry_run=True, max_symbols=2, no_charts=True)
+
+    def test_run_sends_market_regime_and_scan_result_as_separate_messages(self):
+        """시장 전망 메시지와 기본분석 결과 메시지가 별도 텔레그램 메시지로 전송되는지 검증합니다."""
+        config = main.Config(max_workers=1)
+        empty_universe = pd.DataFrame(columns=["Code", "Name", "Sector"])
+        regime = SimpleNamespace(ok=True, is_bull_market=False, current=966.59, ma50=1110.54, kq_return_60=-3.21)
+
+        with (
+            patch.object(main, "setup_korean_font"),
+            patch.object(main, "collect_ohlcv_data", return_value=main.Counter()),
+            patch.object(main, "check_market_regime", return_value=regime),
+            patch.object(main, "load_universe", return_value=empty_universe),
+            patch.object(main, "save_reports", return_value=1),
+            patch.object(main, "send_telegram_msg") as send_msg,
+            patch.object(main, "run_vcp_pipeline"),
+        ):
+            exit_code = main.run(config, dry_run=True, max_symbols=2, no_charts=True)
+
+        self.assertEqual(exit_code, 0)
+        self.assertGreaterEqual(send_msg.call_count, 2)
+        market_message = send_msg.call_args_list[0].args[0]
+        scan_message = send_msg.call_args_list[1].args[0]
+        self.assertIn("[시장국면]", market_message)
+        self.assertIn("50일선", market_message)
+        self.assertIn("[Analysis]", scan_message)
+        self.assertIn("조건을 만족하는 종목이 없습니다.", scan_message)
+
+    def test_format_market_regime_message_includes_bullish_status(self):
+        """강세장일 때도 독립 시장 전망 메시지를 생성하는지 검증합니다."""
+        config = main.Config(target_date="2024-06-10")
+        regime = SimpleNamespace(ok=True, is_bull_market=True, current=1200.0, ma50=1100.0, kq_return_60=5.5)
+
+        message = main.format_market_regime_message(regime, config)
+
+        self.assertIn("2024년 6월 10일(월)", message)
+        self.assertIn("[시장국면]", message)
+        self.assertIn("50일선", message)
+        self.assertIn("+5.50%", message)
 
 
 if __name__ == "__main__":
