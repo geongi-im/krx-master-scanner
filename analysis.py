@@ -519,7 +519,7 @@ def build_message(stock: ScanResult) -> str:
     """
     sector = stock.sector if str(stock.sector).lower() != "nan" and stock.sector else "기타"
     return (
-        "📊 [Analysis 후보]\n"
+        "📊 [퀀트 스캔 후보]\n"
         f"{stock.star_icon} [정통 셋업] {stock.name}({stock.code}) - {sector}\n"
         f"💰 현재가: {stock.curr_p:,.0f}원 (수렴 돌파: {stock.breakout_pct:+.1f}%)\n"
         f"📈 깃대: +{(stock.pole_ratio - 1) * 100:.0f}% | 🎌 수렴: {stock.flag_depth * 100:.1f}%\n"

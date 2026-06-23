@@ -1677,7 +1677,7 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
                 sector_warning = f"⚠️ [섹터 집중 경고] 포착된 종목 중 {count}개가 '{top_sector}'에 집중되어 있습니다.\n\n"
 
         intro_msg = (
-            "📊 [Analysis]\n"
+            "📊 [퀀트 스캔]\n"
             f"🔔 [퀀트 스캔 결과] 포착 종목: {len(found)}개\n"
             f"⏰ 스캔 일시: {now_display}\n\n"
             f"{sector_warning}👇 상위 {min(config.top_send_limit, len(found))}개 브리핑을 시작합니다."
@@ -1694,7 +1694,7 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
             send_telegram_msg(build_message(result), config, dry_run=dry_run)
             time.sleep(0.5)
     else:
-        no_result_msg = "📊 [Analysis]\n💡 조건을 만족하는 종목이 없습니다."
+        no_result_msg = "📊 [퀀트 스캔]\n💡 조건을 만족하는 종목이 없습니다."
         send_telegram_msg(no_result_msg, config, dry_run=dry_run)
         logger.info("조건 만족 종목 없음")
 

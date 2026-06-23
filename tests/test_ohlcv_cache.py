@@ -337,7 +337,7 @@ class OhlcvCacheTest(unittest.TestCase):
         scan_message = send_msg.call_args_list[1].args[0]
         self.assertIn("[시장국면]", market_message)
         self.assertIn("50일선", market_message)
-        self.assertIn("[Analysis]", scan_message)
+        self.assertIn("[퀀트 스캔]", scan_message)
         self.assertIn("조건을 만족하는 종목이 없습니다.", scan_message)
 
     def test_format_market_regime_message_includes_bullish_status(self):
