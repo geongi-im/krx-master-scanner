@@ -56,10 +56,10 @@ VCP_MIN_AVG_TRADED_VALUE=15000000000
 VCP_MAX_DROP_FROM_HIGH=0.18
 # 낮추면 최근 피벗 고점에 더 가까운 종목만 남습니다.
 VCP_MAX_PIVOT_GAP=0.15
-# 낮추면 수축폭 감소가 더 뚜렷한 종목만 남습니다.
-VCP_MAX_CONTRACTION_RATIO=1.0
-# 높이면 최근 Pocket Pivot이 더 많이 나온 종목만 남습니다.
-VCP_MIN_POCKET_PIVOT_COUNT=1
+# 높이면 거래량이 더 강하게 말라붙은 종목만 남습니다.
+VCP_MIN_VOLUME_DRY_UP_RATIO=0.35
+# 늘리면 Pocket Pivot 확인 기간이 길어집니다.
+VCP_POCKET_PIVOT_DAYS=20
 ```
 
 VCP 튜닝 변수는 후보 수와 품질에 직접 영향을 주는 5개만 환경변수로 둡니다.
@@ -67,10 +67,10 @@ VCP 튜닝 변수는 후보 수와 품질에 직접 영향을 주는 5개만 환
 - `VCP_MIN_AVG_TRADED_VALUE`: 20일 평균 거래대금 하한입니다. 높이면 유동성 큰 종목만 남습니다.
 - `VCP_MAX_DROP_FROM_HIGH`: 52주 고점 대비 허용 이격입니다. 낮추면 신고가에 더 가까운 종목만 남습니다.
 - `VCP_MAX_PIVOT_GAP`: 최근 20일 고점 대비 허용 이격입니다. 낮추면 돌파 지점에 가까운 종목만 남습니다.
-- `VCP_MAX_CONTRACTION_RATIO`: 마지막 수축폭이 직전 수축폭 대비 허용되는 비율입니다. `1.0`이면 마지막 수축폭이 직전보다 같거나 작아야 합니다.
-- `VCP_MIN_POCKET_PIVOT_COUNT`: 최근 14일 Pocket Pivot 최소 횟수입니다. 높이면 수급 확인 기준이 엄격해집니다.
+- `VCP_MIN_VOLUME_DRY_UP_RATIO`: 거래량 dry-up 하한입니다. `0.35`는 피크 대비 최근 평균 거래량이 35% 이상 줄어든 구간을 요구합니다.
+- `VCP_POCKET_PIVOT_DAYS`: Pocket Pivot을 확인할 최근 기간입니다. 기본값 `20`은 최근 20거래일 안에 1회 이상 발생한 종목을 통과시킵니다.
 
-VCP 엔진은 추가로 최근 수축폭이 단계적으로 작아지고, 최종 수축폭이 5% 미만이며, 거래량이 피크 대비 70% 이상 줄어드는 dry-up 구간을 요구합니다. 후보 차트에는 Pocket Pivot 발생일을 `PP` 마커로 표시합니다.
+VCP 엔진은 추가로 최근 수축폭이 단계적으로 작아지고, 최종 수축폭이 5% 미만이며, 최근 `VCP_POCKET_PIVOT_DAYS` 안에 Pocket Pivot이 1회 이상 발생한 종목을 요구합니다. 후보 차트에는 Pocket Pivot 발생일을 `PP` 마커로 표시합니다.
 
 `VCP_ENABLED`는 VCP 파이프라인 실행 여부만 제어합니다. 차트 저장 위치는 `data/charts/`로 고정되며, 생성 후 3일이 지난 PNG 차트는 새 차트 저장 시 자동 삭제됩니다. VCP 조회 기간은 내부 계산 기준으로 400일을 사용하고, 텔레그램 발송 상한은 공통 `TOP_SEND_LIMIT`를 따릅니다.
 

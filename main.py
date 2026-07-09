@@ -142,8 +142,8 @@ class Config:
     vcp_min_avg_traded_value: int = field(default_factory=lambda: env_int("VCP_MIN_AVG_TRADED_VALUE", 15_000_000_000))
     vcp_max_drop_from_high: float = field(default_factory=lambda: env_float("VCP_MAX_DROP_FROM_HIGH", 0.18))
     vcp_max_pivot_gap: float = field(default_factory=lambda: env_float("VCP_MAX_PIVOT_GAP", 0.15))
-    vcp_max_contraction_ratio: float = field(default_factory=lambda: env_float("VCP_MAX_CONTRACTION_RATIO", 1.0))
-    vcp_min_pocket_pivot_count: int = field(default_factory=lambda: env_int("VCP_MIN_POCKET_PIVOT_COUNT", 1))
+    vcp_min_volume_dry_up_ratio: float = field(default_factory=lambda: env_float("VCP_MIN_VOLUME_DRY_UP_RATIO", 0.35))
+    vcp_pocket_pivot_days: int = field(default_factory=lambda: env_int("VCP_POCKET_PIVOT_DAYS", 20))
 
     @property
     def telegram_enabled(self) -> bool:
@@ -1111,8 +1111,8 @@ def run_vcp_pipeline(config: Config, *, dry_run: bool, max_symbols: int | None, 
         min_avg_traded_value=config.vcp_min_avg_traded_value,
         max_drop_from_high=config.vcp_max_drop_from_high,
         max_pivot_gap=config.vcp_max_pivot_gap,
-        max_contraction_ratio=config.vcp_max_contraction_ratio,
-        min_pocket_pivot_count=config.vcp_min_pocket_pivot_count,
+        min_volume_dry_up_ratio=config.vcp_min_volume_dry_up_ratio,
+        pocket_pivot_days=config.vcp_pocket_pivot_days,
     )
     logger.info("VCP 스캔 시작")
 

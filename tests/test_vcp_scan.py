@@ -187,13 +187,13 @@ class VcpScanTest(unittest.TestCase):
 
     def test_config_loads_vcp_environment_controls(self):
         """환경변수로 VCP 지표 기준을 제어할 수 있는지 검증합니다."""
-        original = {key: main.os.environ.get(key) for key in ("VCP_MAX_CONTRACTION_RATIO", "VCP_MIN_POCKET_PIVOT_COUNT")}
+        original = {key: main.os.environ.get(key) for key in ("VCP_MIN_VOLUME_DRY_UP_RATIO", "VCP_POCKET_PIVOT_DAYS")}
         try:
-            main.os.environ["VCP_MAX_CONTRACTION_RATIO"] = "1.15"
-            main.os.environ["VCP_MIN_POCKET_PIVOT_COUNT"] = "2"
+            main.os.environ["VCP_MIN_VOLUME_DRY_UP_RATIO"] = "0.4"
+            main.os.environ["VCP_POCKET_PIVOT_DAYS"] = "30"
             config = main.Config()
-            self.assertEqual(config.vcp_max_contraction_ratio, 1.15)
-            self.assertEqual(config.vcp_min_pocket_pivot_count, 2)
+            self.assertEqual(config.vcp_min_volume_dry_up_ratio, 0.4)
+            self.assertEqual(config.vcp_pocket_pivot_days, 30)
         finally:
             for key, value in original.items():
                 if value is None:
