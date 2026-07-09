@@ -245,35 +245,41 @@ def get_clean_universe(max_symbols: int | None = None) -> pd.DataFrame:
         krx_df = fdr.StockListing("KRX")
     except Exception as exc:  # noqa: BLE001 - fallback keeps scanner usable when FDR listing endpoint fails.
         print(f"KRX stock list load failed: {exc}")
-        print("Falling back to MariaDB OHLCV cache symbols...")
-        project_main = runtime()
-
-        config = project_main.Config()
-        _, meta_table = project_main.db_table_names(config)
-        limit_sql = "LIMIT %s" if max_symbols else ""
-        connection = project_main.db_connection(config)
         try:
-            project_main.ensure_ohlcv_cache_tables(connection, config)
-            with connection.cursor() as cursor:
-                params = (max_symbols,) if max_symbols else ()
-                cursor.execute(
-                    f"""
-                    SELECT symbol AS Code, symbol AS Name
-                    FROM {meta_table}
-                    WHERE row_count >= 200
-                    ORDER BY max_trade_date DESC, symbol
-                    {limit_sql}
-                    """,
-                    params,
-                )
-                clean_universe = pd.DataFrame(cursor.fetchall())
-        finally:
-            connection.close()
+            project_main = runtime()
+            krx_df = project_main.load_krx_finder_listing(timeout=project_main.Config().request_timeout)
+            print(f"Loaded KRX stock list from finder fallback: {len(krx_df)} symbols")
+        except Exception as finder_exc:  # noqa: BLE001
+            print(f"KRX finder fallback failed: {finder_exc}")
+            print("Falling back to MariaDB OHLCV cache symbols...")
+            project_main = runtime()
 
-        if clean_universe.empty:
-            raise RuntimeError("MariaDB OHLCV cache has no symbols to scan") from exc
-        print(f"Clean universe ready from MariaDB cache: {len(clean_universe)} symbols")
-        return clean_universe
+            config = project_main.Config()
+            _, meta_table = project_main.db_table_names(config)
+            limit_sql = "LIMIT %s" if max_symbols else ""
+            connection = project_main.db_connection(config)
+            try:
+                project_main.ensure_ohlcv_cache_tables(connection, config)
+                with connection.cursor() as cursor:
+                    params = (max_symbols,) if max_symbols else ()
+                    cursor.execute(
+                        f"""
+                        SELECT symbol AS Code, symbol AS Name
+                        FROM {meta_table}
+                        WHERE row_count >= 200
+                        ORDER BY max_trade_date DESC, symbol
+                        {limit_sql}
+                        """,
+                        params,
+                    )
+                    clean_universe = pd.DataFrame(cursor.fetchall())
+            finally:
+                connection.close()
+
+            if clean_universe.empty:
+                raise RuntimeError("MariaDB OHLCV cache has no symbols to scan") from exc
+            print(f"Clean universe ready from MariaDB cache: {len(clean_universe)} symbols")
+            return clean_universe
 
     blacklist = [
         "KODEX",
@@ -290,6 +296,12 @@ def get_clean_universe(max_symbols: int | None = None) -> pd.DataFrame:
         "ETN",
         "REIT",
         "SPAC",
+        "스팩",
+        "리츠",
+        r"제[0-9]+호",
+        r"우$",
+        "우B",
+        "우C",
     ]
 
     name = krx_df["Name"].astype(str)
@@ -299,7 +311,7 @@ def get_clean_universe(max_symbols: int | None = None) -> pd.DataFrame:
         clean_universe = clean_universe[clean_universe["Code"].astype(str).str.match(r"^\d{6}$")]
 
     if "Market" in clean_universe.columns:
-        clean_universe = clean_universe[clean_universe["Market"].isin(["KOSPI", "KOSDAQ"])]
+        clean_universe = clean_universe[clean_universe["Market"].map(runtime().normalize_krx_market).isin(["KOSPI", "KOSDAQ"])]
 
     clean_universe = clean_universe[["Code", "Name"]].dropna().reset_index(drop=True)
     if max_symbols:
@@ -573,6 +585,15 @@ def get_symbol_name(symbol: str) -> str:
     """
     try:
         universe = fdr.StockListing("KRX")
+        matched = universe[universe["Code"].astype(str) == str(symbol)]
+        if not matched.empty:
+            return str(matched.iloc[0]["Name"])
+    except Exception:
+        pass
+
+    try:
+        project_main = runtime()
+        universe = project_main.load_krx_finder_listing(timeout=project_main.Config().request_timeout)
         matched = universe[universe["Code"].astype(str) == str(symbol)]
         if not matched.empty:
             return str(matched.iloc[0]["Name"])

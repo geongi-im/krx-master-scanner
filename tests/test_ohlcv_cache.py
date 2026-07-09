@@ -38,6 +38,103 @@ class OhlcvCacheTest(unittest.TestCase):
             index=index,
         )
 
+    def test_load_krx_finder_listing_parses_current_finder_response(self):
+        """KRX finder fallback이 종목 코드, 이름, 시장을 표준 컬럼으로 변환하는지 검증합니다."""
+
+        class FakeResponse:
+            text = "{\"block1\": []}"
+            content = (
+                '{"block1": ['
+                '{"short_code": "060310", "codeName": "3S", "marketEngName": "KOSDAQ"},'
+                '{"short_code": "095570", "codeName": "AJ네트웍스", "marketEngName": "KOSPI"},'
+                '{"short_code": "1234H0", "codeName": "테스트스팩", "marketEngName": "KOSDAQ GLOBAL"}'
+                "]}"
+            ).encode("utf-8")
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "block1": [
+                        {"short_code": "060310", "codeName": "3S", "marketEngName": "KOSDAQ"},
+                        {"short_code": "095570", "codeName": "AJ네트웍스", "marketEngName": "KOSPI"},
+                        {"short_code": "1234H0", "codeName": "테스트스팩", "marketEngName": "KOSDAQ GLOBAL"},
+                    ]
+                }
+
+        with patch.object(main.requests, "post", return_value=FakeResponse()) as post:
+            listing = main.load_krx_finder_listing(timeout=3)
+
+        post.assert_called_once()
+        self.assertEqual(list(listing.columns), ["Code", "Name", "Market"])
+        self.assertEqual(listing.loc[0, "Code"], "060310")
+        self.assertEqual(listing.loc[2, "Market"], "KOSDAQ")
+        self.assertFalse(bool(listing.attrs["has_market_data"]))
+
+    def test_load_collection_universe_uses_krx_finder_when_fdr_listing_fails(self):
+        """FDR KRX 목록이 깨져도 KRX finder fallback으로 수집 유니버스를 구성합니다."""
+        config = main.Config()
+        finder = pd.DataFrame(
+            [
+                {"Code": "060310", "Name": "3S", "Market": "KOSDAQ"},
+                {"Code": "095570", "Name": "AJ네트웍스", "Market": "KOSPI"},
+                {"Code": "1234H0", "Name": "문자코드", "Market": "KOSDAQ"},
+                {"Code": "000001", "Name": "테스트스팩", "Market": "KOSDAQ"},
+                {"Code": "000002", "Name": "우선주우", "Market": "KOSPI"},
+                {"Code": "000003", "Name": "코넥스", "Market": "KONEX"},
+            ]
+        )
+        desc = pd.DataFrame(
+            [
+                {"Code": "060310", "Sector": "기계"},
+                {"Code": "095570", "Sector": "서비스"},
+            ]
+        )
+
+        with (
+            patch.object(main.fdr, "StockListing", side_effect=ValueError("LOGOUT")),
+            patch.object(main, "load_krx_finder_listing", return_value=finder),
+            patch.object(main, "load_krx_desc_listing", return_value=desc),
+        ):
+            universe = main.load_collection_universe(config)
+
+        self.assertEqual(universe.to_dict("records"), [
+            {"Code": "060310", "Name": "3S", "Sector": "기계"},
+            {"Code": "095570", "Name": "AJ네트웍스", "Sector": "서비스"},
+        ])
+
+    def test_load_krx_listing_skips_fdr_when_direct_krx_listing_is_available(self):
+        """정상 KRX 직접 endpoint가 있으면 FDR 시총 endpoint를 호출하지 않습니다."""
+        config = main.Config()
+        finder = pd.DataFrame([{"Code": "060310", "Name": "3S", "Market": "KOSDAQ"}])
+        desc = pd.DataFrame([{"Code": "060310", "Sector": "Machine"}])
+
+        with (
+            patch.object(main, "load_krx_finder_listing", return_value=finder),
+            patch.object(main, "load_krx_desc_listing", return_value=desc),
+            patch.object(main.fdr, "StockListing") as stock_listing,
+        ):
+            listing = main.load_krx_listing(config)
+
+        stock_listing.assert_not_called()
+        self.assertEqual(listing.to_dict("records"), [{"Code": "060310", "Name": "3S", "Market": "KOSDAQ", "Sector": "Machine"}])
+
+    def test_load_universe_uses_db_price_filter_when_finder_has_no_market_data(self):
+        """finder fallback처럼 가격/거래대금 컬럼이 없으면 DB 캐시 기반 1차 필터를 사용합니다."""
+        config = main.Config()
+        listing = pd.DataFrame([{"Code": "060310", "Name": "3S", "Market": "KOSDAQ", "Sector": ""}])
+        db_universe = pd.DataFrame([{"Code": "060310", "Name": "3S", "Sector": ""}])
+
+        with (
+            patch.object(main, "load_krx_listing", return_value=listing),
+            patch.object(main, "load_universe_from_db_cache", return_value=db_universe) as load_db,
+        ):
+            universe = main.load_universe(config, max_symbols=5)
+
+        load_db.assert_called_once_with(config, max_symbols=5)
+        self.assertIs(universe, db_universe)
+
     def test_fetch_ohlcv_reuses_db_cache_and_fetches_only_incremental_range(self):
         """캐시가 있으면 마지막 캐시일부터 증분 구간만 조회하는지 검증합니다."""
         cached = self.frame("2024-01-01", 5)

@@ -11,6 +11,7 @@ KRX Master Scanner
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -53,6 +54,14 @@ VCP_LOOKBACK_DAYS = 400
 CHART_RETENTION_DAYS = 3
 TARGET_CACHE_MIN_COVERAGE_RATIO = 0.90
 TARGET_CACHE_MIN_READY_SYMBOLS = 1000
+KRX_REQUEST_HEADERS = {
+    "User-Agent": "Chrome/78.0.3904.87 Safari/537.36",
+    "Referer": "http://data.krx.co.kr/",
+}
+KRX_FINDER_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+KRX_KIND_CORP_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
+KRX_STOCK_MARKETS = {"KOSPI", "KOSDAQ"}
+KRX_EXCLUDE_NAME_PATTERN = r"스팩|제[0-9]+호|우$|우B|우C|리츠|ETF|ETN"
 
 for directory in (DATA_DIR, CHART_DIR, LOG_DIR, ASSET_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -269,6 +278,180 @@ def safe_filename(value: str) -> str:
         파일명에 사용할 수 있는 문자만 남긴 문자열입니다.
     """
     return re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", value)
+
+
+def normalize_stock_code(value: object) -> str:
+    """KRX 종목 코드를 비교 가능한 문자열로 정리합니다."""
+    code = str(value or "").strip()
+    if code.endswith(".0"):
+        code = code[:-2]
+    return code.zfill(6) if code.isdigit() else code
+
+
+def normalize_krx_market(value: object) -> str:
+    """KRX 시장명을 프로젝트 필터에서 쓰는 값으로 정규화합니다."""
+    market = str(value or "").strip().upper()
+    if market.startswith("KOSDAQ"):
+        return "KOSDAQ"
+    if market.startswith("KOSPI"):
+        return "KOSPI"
+    if market.startswith("KONEX"):
+        return "KONEX"
+    return market
+
+
+def repair_utf8_mojibake(value: object) -> str:
+    """UTF-8 한글이 Latin-1로 잘못 해석된 문자열을 복구합니다."""
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value or "").strip()
+    if not text or not re.search(r"[ìíëêÃÂ]", text):
+        return text
+    try:
+        repaired = text.encode("latin1").decode("utf-8")
+    except UnicodeError:
+        return text
+    return repaired if re.search(r"[가-힣]", repaired) else text
+
+
+def load_krx_finder_listing(timeout: int = 10) -> pd.DataFrame:
+    """KRX 종목검색 endpoint에서 기본 종목 리스트를 조회합니다.
+
+    FinanceDataReader의 KRX 시총 endpoint가 LOGOUT을 반환할 때도 이 endpoint는
+    독립적으로 동작하므로 종목 코드/이름 fallback으로 사용합니다.
+    """
+    response = requests.post(
+        KRX_FINDER_URL,
+        headers=KRX_REQUEST_HEADERS,
+        data={"bld": "dbms/comm/finder/finder_stkisu"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    try:
+        payload = json.loads(response.content.decode("utf-8"))
+    except ValueError as exc:
+        raise RuntimeError(f"KRX finder JSON 파싱 실패: {response.text[:120]}") from exc
+
+    rows = payload.get("block1") or []
+    if not rows:
+        raise RuntimeError("KRX finder 응답에 종목 목록이 없습니다.")
+
+    raw = pd.DataFrame(rows)
+    required = {"short_code", "codeName", "marketEngName"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise RuntimeError(f"KRX finder 응답 컬럼 누락: {sorted(missing)}")
+
+    listing = pd.DataFrame(
+        {
+            "Code": raw["short_code"].map(normalize_stock_code),
+            "Name": raw["codeName"].map(repair_utf8_mojibake),
+            "Market": raw["marketEngName"].map(normalize_krx_market),
+        }
+    )
+    listing = listing.dropna(subset=["Code", "Name"]).drop_duplicates(subset="Code").reset_index(drop=True)
+    listing.attrs = {"exchange": "KRX", "source": "KRX finder", "data": "LISTINGS", "has_market_data": False}
+    return listing
+
+
+def load_krx_desc_listing(timeout: int = 10) -> pd.DataFrame:
+    """KIND 상장법인목록에서 섹터 정보를 조회합니다.
+
+    일부 신규 상장/스팩 코드는 숫자가 아닌 문자가 섞일 수 있으므로 FDR처럼
+    정수 포맷을 강제하지 않고 문자열 코드로 처리합니다.
+    """
+    response = requests.get(KRX_KIND_CORP_LIST_URL, headers=KRX_REQUEST_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    html = response.content.decode("euc-kr", errors="replace")
+    tables = pd.read_html(io.StringIO(html), header=0)
+    if not tables:
+        raise RuntimeError("KIND 상장법인목록 테이블이 없습니다.")
+
+    raw = tables[0]
+    required = {"종목코드", "업종"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise RuntimeError(f"KIND 상장법인목록 컬럼 누락: {sorted(missing)}")
+
+    desc = pd.DataFrame(
+        {
+            "Code": raw["종목코드"].map(normalize_stock_code),
+            "Sector": raw["업종"].map(repair_utf8_mojibake),
+        }
+    )
+    return desc.drop_duplicates(subset="Code").reset_index(drop=True)
+
+
+def load_krx_listing(config: Config) -> pd.DataFrame:
+    """KRX 직접 endpoint 우선, FDR fallback 순서로 종목 리스트를 조회합니다."""
+    try:
+        basic = load_krx_finder_listing(timeout=config.request_timeout)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KRX finder 종목 리스트 조회 실패. FDR KRX fallback 사용: %s", exc)
+        basic = fdr.StockListing("KRX")
+        basic = basic.copy()
+        basic["Code"] = basic["Code"].map(normalize_stock_code)
+        if "Market" in basic.columns:
+            basic["Market"] = basic["Market"].map(normalize_krx_market)
+        basic.attrs["has_market_data"] = "Close" in basic.columns and "Amount" in basic.columns
+
+    try:
+        desc = load_krx_desc_listing(timeout=config.request_timeout)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            desc = fdr.StockListing("KRX-DESC")[["Code", "Sector"]].copy()
+            desc["Code"] = desc["Code"].map(normalize_stock_code)
+            logger.warning("KIND 섹터 직접 조회 실패. FDR KRX-DESC fallback 사용: %s", exc)
+        except Exception as desc_exc:  # noqa: BLE001
+            logger.warning("KIND 섹터 조회 실패. Sector 없이 진행: %s", desc_exc)
+            desc = pd.DataFrame(columns=["Code", "Sector"])
+
+    if "Sector" not in basic.columns:
+        basic = pd.merge(basic, desc, on="Code", how="left")
+    if "Sector" not in basic.columns:
+        basic["Sector"] = ""
+    basic["Sector"] = basic["Sector"].fillna("")
+    return basic
+
+
+def filter_tradeable_krx_universe(universe: pd.DataFrame) -> pd.DataFrame:
+    """스캐너 대상이 아닌 ETF/ETN/스팩/우선주 등을 제외합니다."""
+    if universe.empty:
+        return universe
+    filtered = universe.copy()
+    if "Market" in filtered.columns:
+        filtered = filtered[filtered["Market"].map(normalize_krx_market).isin(KRX_STOCK_MARKETS)]
+    filtered = filtered[filtered["Code"].astype(str).str.match(r"^\d{6}$")]
+    filtered = filtered[~filtered["Name"].astype(str).str.contains(KRX_EXCLUDE_NAME_PATTERN, regex=True, na=False)]
+    return filtered
+
+
+def enrich_universe_with_krx_reference(universe: pd.DataFrame, config: Config) -> pd.DataFrame:
+    """DB 캐시 기반 유니버스에 KRX 이름/섹터 정보를 보강합니다."""
+    if universe.empty or "Code" not in universe.columns:
+        return universe
+    try:
+        reference = load_krx_finder_listing(timeout=config.request_timeout)
+        try:
+            desc = load_krx_desc_listing(timeout=config.request_timeout)
+            reference = pd.merge(reference, desc, on="Code", how="left")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DB 유니버스 섹터 보강 실패. 이름만 보강: %s", exc)
+            reference["Sector"] = ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DB 유니버스 KRX 이름 보강 실패: %s", exc)
+        return universe
+
+    reference = reference[["Code", "Name", "Sector"]].drop_duplicates(subset="Code")
+    merged = pd.merge(
+        universe.copy(),
+        reference.rename(columns={"Name": "KrxName", "Sector": "KrxSector"}),
+        on="Code",
+        how="left",
+    )
+    merged["Name"] = merged["KrxName"].where(merged["KrxName"].fillna("").astype(str).str.len() > 0, merged.get("Name", ""))
+    merged["Sector"] = merged["KrxSector"].where(merged["KrxSector"].fillna("").astype(str).str.len() > 0, merged.get("Sector", ""))
+    return merged.drop(columns=["KrxName", "KrxSector"]).fillna("")
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -1197,6 +1380,7 @@ def load_collection_universe_from_db_cache(config: Config, max_symbols: int | No
 
     if universe.empty:
         return pd.DataFrame(columns=["Code", "Name", "Sector"])
+    universe = enrich_universe_with_krx_reference(universe[["Code", "Name", "Sector"]].fillna(""), config)
     return universe[["Code", "Name", "Sector"]].fillna("").reset_index(drop=True)
 
 
@@ -1211,22 +1395,12 @@ def load_collection_universe(config: Config, max_symbols: int | None = None) -> 
         Code, Name, Sector 컬럼을 가진 수집 대상 종목 유니버스입니다.
     """
     try:
-        basic = fdr.StockListing("KRX")
+        universe = load_krx_listing(config)
     except Exception as exc:  # noqa: BLE001
         logger.warning("KRX 종목 리스트 조회 실패. MariaDB OHLCV 캐시 종목으로 전체 수집 진행: %s", exc)
         return load_collection_universe_from_db_cache(config, max_symbols=max_symbols)
 
-    try:
-        desc = fdr.StockListing("KRX-DESC")[["Code", "Sector"]]
-        universe = pd.merge(basic, desc, on="Code", how="left")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("KRX-DESC 조회 실패. Sector 없이 전체 수집 진행: %s", exc)
-        universe = basic.copy()
-        universe["Sector"] = ""
-
-    universe = universe[universe["Market"].isin(["KOSPI", "KOSDAQ"])]
-    universe = universe[universe["Code"].astype(str).str.match(r"^\d{6}$")]
-    universe = universe[~universe["Name"].astype(str).str.contains(r"스팩|제[0-9]+호|우$|우B|우C|리츠|ETF|ETN", regex=True, na=False)]
+    universe = filter_tradeable_krx_universe(universe)
     universe = universe[["Code", "Name", "Sector"]].fillna("").reset_index(drop=True)
     if max_symbols:
         universe = universe.head(max_symbols)
@@ -1469,6 +1643,7 @@ def load_universe_from_db_cache(config: Config, max_symbols: int | None = None) 
 
     if universe.empty:
         return pd.DataFrame(columns=["Code", "Name", "Sector"])
+    universe = enrich_universe_with_krx_reference(universe[["Code", "Name", "Sector"]].fillna(""), config)
     return universe[["Code", "Name", "Sector"]].fillna("").reset_index(drop=True)
 
 
@@ -1487,22 +1662,15 @@ def load_universe(config: Config, max_symbols: int | None = None) -> pd.DataFram
         return load_universe_from_db_cache(config, max_symbols=max_symbols)
 
     try:
-        basic = fdr.StockListing("KRX")
+        universe = load_krx_listing(config)
     except Exception as exc:  # noqa: BLE001
         logger.warning("KRX 종목 리스트 조회 실패. MariaDB OHLCV 캐시 종목으로 진행: %s", exc)
         return load_universe_from_db_cache(config, max_symbols=max_symbols)
 
-    try:
-        desc = fdr.StockListing("KRX-DESC")[["Code", "Sector"]]
-        universe = pd.merge(basic, desc, on="Code", how="left")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("KRX-DESC 조회 실패. Sector 없이 진행: %s", exc)
-        universe = basic.copy()
-        universe["Sector"] = ""
-
-    universe = universe[universe["Market"].isin(["KOSPI", "KOSDAQ"])]
-    universe = universe[universe["Code"].astype(str).str.match(r"^\d{6}$")]
-    universe = universe[~universe["Name"].astype(str).str.contains(r"스팩|제[0-9]+호|우$|우B|우C|리츠|ETF|ETN", regex=True, na=False)]
+    universe = filter_tradeable_krx_universe(universe)
+    if "Close" not in universe.columns or "Amount" not in universe.columns:
+        logger.warning("KRX 종목 리스트에 가격/거래대금이 없어 MariaDB OHLCV 캐시 기준 1차 필터로 진행")
+        return load_universe_from_db_cache(config, max_symbols=max_symbols)
 
     if "Close" in universe.columns:
         universe = universe[universe["Close"].fillna(0) >= config.first_pass_min_close]

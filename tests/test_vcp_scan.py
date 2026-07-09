@@ -125,6 +125,28 @@ class VcpScanTest(unittest.TestCase):
         self.assertEqual(len(pivots), 1)
         self.assertEqual(pivots.index[0], pd.Timestamp("2026-01-06"))
 
+    def test_get_clean_universe_uses_krx_finder_fallback(self):
+        """FDR KRX 목록이 실패하면 VCP 유니버스도 KRX finder fallback을 사용합니다."""
+        finder = pd.DataFrame(
+            [
+                {"Code": "060310", "Name": "3S", "Market": "KOSDAQ"},
+                {"Code": "095570", "Name": "AJ네트웍스", "Market": "KOSPI"},
+                {"Code": "000001", "Name": "테스트스팩", "Market": "KOSDAQ"},
+                {"Code": "000002", "Name": "코넥스", "Market": "KONEX"},
+            ]
+        )
+
+        with (
+            patch.object(vcp_scan.fdr, "StockListing", side_effect=ValueError("LOGOUT")),
+            patch.object(main, "load_krx_finder_listing", return_value=finder),
+        ):
+            universe = vcp_scan.get_clean_universe()
+
+        self.assertEqual(universe.to_dict("records"), [
+            {"Code": "060310", "Name": "3S"},
+            {"Code": "095570", "Name": "AJ네트웍스"},
+        ])
+
     def test_run_vcp_engine_passes_target_date_to_bulk_cache_loader(self):
         """VCP 기준일이 bulk 캐시 조회 종료일로 전달되는지 검증합니다."""
         universe = pd.DataFrame(columns=["Code", "Name"])
