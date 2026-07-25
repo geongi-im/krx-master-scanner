@@ -1855,7 +1855,7 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
         for result in found[: config.top_send_limit]:
             chart_file = None
             if config.send_charts and not no_charts:
-                chart_file = generate_chart(result.code, result.name, result.entry_p, result.target_p, result.stop_p, config)
+                chart_file = generate_chart(result.code, result.name, result.entry_p, result.target_p, result.stop_p, config, stock=result)
                 if chart_file:
                     send_telegram_photo(chart_file, config, dry_run=dry_run)
                     time.sleep(0.5)

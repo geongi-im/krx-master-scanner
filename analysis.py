@@ -17,7 +17,16 @@ import requests
 from bs4 import BeautifulSoup
 from matplotlib.ticker import FuncFormatter
 
+from vcp_scan import calculate_swing_segments
+
 logger = logging.getLogger("krx-master-scanner")
+
+SUPPLY_ZONE_LOOKBACK_DAYS = 120
+SUPPLY_ZONE_BINS = 24
+SUPPLY_ZONE_MIN_ROWS = 30
+SUPPLY_ZONE_NEAR_GAP_RATIO = 0.03
+CHART_FETCH_DAYS = 400
+CHART_VISIBLE_BARS = 120
 
 
 @dataclass
@@ -57,6 +66,15 @@ class ScanResult:
     ref_date: str
     material_info: str = ""
     quant_scenario: str = ""
+    vcp_contraction_pct: float | None = None
+    vcp_contraction_trend: str = "측정 불가"
+    supply_zone_price: float | None = None
+    supply_zone_low: float | None = None
+    supply_zone_high: float | None = None
+    supply_zone_status: str = ""
+    sniper_score: int = 0
+    sniper_verdict: str = ""
+    sniper_reading: str = ""
 
 
 @dataclass
@@ -110,6 +128,147 @@ def check_market_regime(config: Any) -> MarketRegime:
     except Exception as exc:  # noqa: BLE001
         logger.exception("시장 국면 조회 실패")
         return MarketRegime(False, False, 0.0, 0.0, 0.0, str(exc))
+
+
+def calculate_supply_zone(
+    df: pd.DataFrame,
+    *,
+    lookback_days: int = SUPPLY_ZONE_LOOKBACK_DAYS,
+    bins: int = SUPPLY_ZONE_BINS,
+) -> dict[str, float] | None:
+    """최근 가격대별 거래량에서 최대 매물대(POC) 구간을 계산합니다.
+
+    Args:
+        df: High, Low, Close, Volume 컬럼을 가진 OHLCV 데이터프레임입니다.
+        lookback_days: 매물대를 계산할 최근 기간입니다.
+        bins: 가격 구간을 나눌 개수입니다.
+
+    Returns:
+        매물대 대표 가격, 구간 상단/하단, 거래량 비중입니다. 데이터가 부족하면 None입니다.
+    """
+    recent = df.tail(lookback_days)
+    typical_price = (
+        pd.to_numeric(recent["High"], errors="coerce")
+        + pd.to_numeric(recent["Low"], errors="coerce")
+        + pd.to_numeric(recent["Close"], errors="coerce")
+    ) / 3
+    volume = pd.to_numeric(recent["Volume"], errors="coerce")
+
+    valid = typical_price.notna() & volume.notna() & (volume > 0)
+    typical_price = typical_price[valid]
+    volume = volume[valid]
+    if len(typical_price) < SUPPLY_ZONE_MIN_ROWS:
+        return None
+    if float(typical_price.max()) <= float(typical_price.min()):
+        return None
+
+    bin_labels = pd.cut(typical_price, bins=bins)
+    profile = volume.groupby(bin_labels, observed=False).sum()
+    if profile.empty:
+        return None
+
+    poc_interval = profile.idxmax()
+    in_poc = bin_labels == poc_interval
+    poc_volume = float(volume[in_poc].sum())
+    total_volume = float(volume.sum())
+    if poc_volume <= 0 or total_volume <= 0:
+        return None
+
+    zone_price = float((typical_price[in_poc] * volume[in_poc]).sum() / poc_volume)
+    return {
+        "zone_price": zone_price,
+        "zone_low": float(poc_interval.left),
+        "zone_high": float(poc_interval.right),
+        "volume_share": poc_volume / total_volume,
+    }
+
+
+def classify_supply_zone_status(
+    current_price: float,
+    zone_low: float,
+    zone_high: float,
+    *,
+    near_gap_ratio: float = SUPPLY_ZONE_NEAR_GAP_RATIO,
+) -> str:
+    """현재가와 매물대 구간의 위치 관계를 판독합니다.
+
+    Args:
+        current_price: 현재 종가입니다.
+        zone_low: 매물대 구간 하단 가격입니다.
+        zone_high: 매물대 구간 상단 가격입니다.
+        near_gap_ratio: 임박으로 볼 매물대 하단 대비 이격 비율입니다.
+
+    Returns:
+        돌파, 돌파 시도, 임박, 대기 중 하나입니다.
+    """
+    if current_price > zone_high:
+        return "돌파"
+    if current_price >= zone_low:
+        return "돌파 시도"
+    if zone_low > 0 and (zone_low - current_price) / zone_low <= near_gap_ratio:
+        return "임박"
+    return "대기"
+
+
+def calculate_sniper_score(
+    *,
+    supply_zone_status: str | None,
+    final_contraction_pct: float | None,
+    contraction_decreasing: bool,
+    rs_score: float,
+    vol_ratio: float,
+    stars: int,
+    is_nr3: bool,
+    is_kulamegi_htf: bool,
+) -> tuple[int, str]:
+    """규칙 기반 스나이퍼 점수(0~100)와 판정을 계산합니다.
+
+    Args:
+        supply_zone_status: 매물대 판독 상태입니다.
+        final_contraction_pct: 마지막 VCP 수축폭(%)입니다.
+        contraction_decreasing: 최근 수축폭이 단계적으로 줄었는지 여부입니다.
+        rs_score: 지수 대비 상대강도 점수입니다.
+        vol_ratio: 50일 평균 대비 당일 거래량 비율입니다.
+        stars: 셋업 등급(3~5)입니다.
+        is_nr3: NR3 패턴 발생 여부입니다.
+        is_kulamegi_htf: 쿨라메기 HTF 셋업 여부입니다.
+
+    Returns:
+        점수와 적극/중립/관망 판정 라벨입니다.
+    """
+    score = 0
+    score += {"돌파": 25, "돌파 시도": 15, "임박": 10}.get(supply_zone_status or "", 0)
+
+    if final_contraction_pct is not None:
+        if final_contraction_pct <= 5.0:
+            score += 20
+        elif final_contraction_pct <= 8.0:
+            score += 12
+    if contraction_decreasing:
+        score += 10
+
+    if rs_score >= 10:
+        score += 20
+    elif rs_score > 0:
+        score += 12
+
+    if vol_ratio >= 1.5 or vol_ratio < 0.8:
+        score += 10
+
+    score += {5: 15, 4: 10, 3: 5}.get(stars, 0)
+    if is_kulamegi_htf:
+        score += 6
+    if is_nr3:
+        score += 4
+
+    score = min(score, 100)
+    if score >= 70:
+        verdict = "적극"
+    elif score >= 50:
+        verdict = "중립"
+    else:
+        verdict = "관망"
+    return score, verdict
 
 
 def generate_quant_scenario(
@@ -404,6 +563,43 @@ def analyze_stock(stock_info: tuple[str, str, str], kq_return_60: float, config:
                         break
             fib_summary = f"피보나치 레벨: {current_fib_desc}"
 
+        swing_segments = calculate_swing_segments(clean_df["Close"])
+        swing_drops = [float(segment["drop_pct"]) for segment in swing_segments][-3:]
+        vcp_contraction_pct = swing_drops[-1] if swing_drops else None
+        vcp_contraction_trend = " → ".join(f"-{drop:.1f}%" for drop in swing_drops) if swing_drops else "측정 불가"
+        contraction_decreasing = len(swing_drops) >= 2 and all(
+            later < earlier for earlier, later in zip(swing_drops, swing_drops[1:])
+        )
+        if swing_drops:
+            vcp_status += f" (수축폭 {vcp_contraction_trend})"
+
+        supply_zone = calculate_supply_zone(clean_df)
+        supply_zone_price = supply_zone_low = supply_zone_high = None
+        supply_zone_status = ""
+        if supply_zone is not None:
+            supply_zone_price = float(supply_zone["zone_price"])
+            supply_zone_low = float(supply_zone["zone_low"])
+            supply_zone_high = float(supply_zone["zone_high"])
+            supply_zone_status = classify_supply_zone_status(curr_p, supply_zone_low, supply_zone_high)
+
+        sniper_score, sniper_verdict = calculate_sniper_score(
+            supply_zone_status=supply_zone_status or None,
+            final_contraction_pct=vcp_contraction_pct,
+            contraction_decreasing=contraction_decreasing,
+            rs_score=rs_score,
+            vol_ratio=vol_ratio,
+            stars=stars,
+            is_nr3=is_nr3,
+            is_kulamegi_htf=is_kulamegi_htf,
+        )
+        if supply_zone_price is not None:
+            zone_desc = f"매물대({supply_zone_price:,.0f}원) {supply_zone_status}"
+            reading_tag = supply_zone_status
+        else:
+            zone_desc = "매물대 미산출"
+            reading_tag = "대기"
+        sniper_reading = f"[{reading_tag}] {zone_desc} / 스나이퍼 점수 {sniper_score}점 ({sniper_verdict})"
+
         quant_scenario, entry_p, target_p, stop_p = generate_quant_scenario(
             curr_p=curr_p,
             flag_high=flag_high,
@@ -439,6 +635,15 @@ def analyze_stock(stock_info: tuple[str, str, str], kq_return_60: float, config:
             stop_p=stop_p,
             ref_date=ref_date,
             quant_scenario=quant_scenario,
+            vcp_contraction_pct=vcp_contraction_pct,
+            vcp_contraction_trend=vcp_contraction_trend,
+            supply_zone_price=supply_zone_price,
+            supply_zone_low=supply_zone_low,
+            supply_zone_high=supply_zone_high,
+            supply_zone_status=supply_zone_status,
+            sniper_score=sniper_score,
+            sniper_verdict=sniper_verdict,
+            sniper_reading=sniper_reading,
         )
         return AnalysisOutcome("found", code, name, "통과", result=result)
     except Exception as exc:  # noqa: BLE001
@@ -446,7 +651,15 @@ def analyze_stock(stock_info: tuple[str, str, str], kq_return_60: float, config:
         return AnalysisOutcome("failed", code, name, "예외", error=str(exc))
 
 
-def generate_chart(code: str, name: str, entry_p: float, target_p: float, stop_p: float, config: Any) -> Path | None:
+def generate_chart(
+    code: str,
+    name: str,
+    entry_p: float,
+    target_p: float,
+    stop_p: float,
+    config: Any,
+    stock: ScanResult | None = None,
+) -> Path | None:
     """종합분석 후보의 차트 이미지를 생성합니다.
 
     Args:
@@ -456,16 +669,21 @@ def generate_chart(code: str, name: str, entry_p: float, target_p: float, stop_p
         target_p: 목표가입니다.
         stop_p: 손절가입니다.
         config: OHLCV 조회와 차트 저장 경로 설정입니다.
+        stock: 타점 분석 요약 박스에 표시할 분석 결과입니다. None이면 생략합니다.
 
     Returns:
         생성된 차트 파일 경로입니다. 데이터가 부족하면 None입니다.
     """
     project_main = runtime()
     try:
-        start_date = project_main.window_start_date(config, 120)
-        df = project_main.fetch_ohlcv(code, start_date, config)
-        if len(df) < 20:
+        start_date = project_main.window_start_date(config, CHART_FETCH_DAYS)
+        df_full = project_main.fetch_ohlcv(code, start_date, config)
+        if len(df_full) < 20:
             return None
+        plot_df = df_full.tail(CHART_VISIBLE_BARS).copy()
+
+        swing_segments = calculate_swing_segments(df_full["Close"])
+        supply_zone = calculate_supply_zone(df_full)
 
         mc = mpf.make_marketcolors(up="r", down="b", edge="inherit", wick="inherit", volume="inherit")
         rc_params = {"font.family": mpl.rcParams["font.family"], "axes.unicode_minus": False}
@@ -478,15 +696,21 @@ def generate_chart(code: str, name: str, entry_p: float, target_p: float, stop_p
             linewidths=1.5,
         )
 
+        addplots = []
+        for ma_window, ma_color in ((20, "#2a7fb8"), (50, "#f28e2b"), (200, "#2f9e44")):
+            ma_values = df_full["Close"].rolling(ma_window).mean().tail(len(plot_df))
+            if ma_values.notna().any():
+                addplots.append(mpf.make_addplot(ma_values.to_numpy(), color=ma_color, width=1.0))
+
         fig, axlist = mpf.plot(
-            df,
+            plot_df,
             type="candle",
             volume=True,
-            mav=(5, 10, 20, 50),
-            title=f"{name} ({code}) - 3 Months Setup",
+            addplot=addplots or None,
+            title=f"[퀀트 스나이퍼] {name} ({code})",
             hlines=hlines_config,
             style=style,
-            figsize=(10, 6),
+            figsize=(11, 7),
             datetime_format="%y.%m.%d",
             returnfig=True,
         )
@@ -494,9 +718,72 @@ def generate_chart(code: str, name: str, entry_p: float, target_p: float, stop_p
         ax = axlist[0]
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
         bbox_props = dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.7)
-        ax.text(0, target_p, " 목표가", color="red", fontsize=10, va="bottom", ha="left", fontweight="bold", bbox=bbox_props)
-        ax.text(0, entry_p, " 매수가", color="green", fontsize=10, va="bottom", ha="left", fontweight="bold", bbox=bbox_props)
-        ax.text(0, stop_p, " 손절가", color="blue", fontsize=10, va="top", ha="left", fontweight="bold", bbox=bbox_props)
+        label_x = len(plot_df) - 1
+        ax.text(label_x, target_p, "목표가 ", color="red", fontsize=10, va="bottom", ha="right", fontweight="bold", bbox=bbox_props)
+        ax.text(label_x, entry_p, "매수가 ", color="green", fontsize=10, va="bottom", ha="right", fontweight="bold", bbox=bbox_props)
+        ax.text(label_x, stop_p, "손절가 ", color="blue", fontsize=10, va="top", ha="right", fontweight="bold", bbox=bbox_props)
+
+        if supply_zone is not None:
+            zone_low = float(supply_zone["zone_low"])
+            zone_high = float(supply_zone["zone_high"])
+            zone_price = float(supply_zone["zone_price"])
+            ax.axhspan(zone_low, zone_high, facecolor="#a6cee3", alpha=0.35, zorder=0)
+            ax.axhline(zone_price, color="#3c78b4", linestyle="--", linewidth=1.2, alpha=0.85)
+            ax.text(
+                len(plot_df) - 1,
+                zone_high,
+                f"매물대 {zone_price:,.0f}",
+                color="#1f4e79",
+                fontsize=9,
+                va="bottom",
+                ha="right",
+                fontweight="bold",
+                bbox=bbox_props,
+            )
+
+        date_to_pos = {timestamp: idx for idx, timestamp in enumerate(plot_df.index)}
+        visible_segments = [
+            segment
+            for segment in swing_segments
+            if pd.Timestamp(segment["peak_date"]) in date_to_pos and pd.Timestamp(segment["trough_date"]) in date_to_pos
+        ][-3:]
+        for segment in visible_segments:
+            peak_x = date_to_pos[pd.Timestamp(segment["peak_date"])]
+            trough_x = date_to_pos[pd.Timestamp(segment["trough_date"])]
+            peak_price = float(segment["peak_price"])
+            trough_price = float(segment["trough_price"])
+            ax.plot([peak_x, trough_x], [peak_price, trough_price], color="#2eb872", linewidth=1.8, alpha=0.9)
+            ax.annotate(
+                f"-{float(segment['drop_pct']):.1f}%",
+                xy=(trough_x, trough_price),
+                xytext=(0, -16),
+                textcoords="offset points",
+                ha="center",
+                color="red",
+                fontsize=9,
+                fontweight="bold",
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": "#fff6ba", "edgecolor": "none", "alpha": 0.85},
+            )
+
+        if stock is not None:
+            rs_flag = "RS 강세" if stock.rs_score > 0 else "RS 약세"
+            summary = (
+                f"[{name} 타점 분석]\n"
+                f"▶ 미너비니 필터 통과 ({rs_flag} {stock.rs_score:+.1f})\n"
+                f"▶ VCP 수축폭: {stock.vcp_contraction_trend}\n"
+                f"▶ 스나이퍼 판독: {stock.sniper_reading}"
+            )
+            ax.text(
+                0.02,
+                0.97,
+                summary,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                zorder=10,
+                bbox={"boxstyle": "round,pad=0.5", "facecolor": "#f8f8f8", "edgecolor": "#8b1a1a", "alpha": 0.92},
+            )
 
         project_main.cleanup_old_chart_images(project_main.CHART_DIR)
         output = project_main.CHART_DIR / f"chart_{code}_{datetime.now(project_main.KST).strftime('%Y%m%d_%H%M%S')}.png"
@@ -518,6 +805,10 @@ def build_message(stock: ScanResult) -> str:
         텔레그램으로 전송할 종목 브리핑 메시지입니다.
     """
     sector = stock.sector if str(stock.sector).lower() != "nan" and stock.sector else "기타"
+    if stock.supply_zone_low is not None and stock.supply_zone_high is not None:
+        zone_band_text = f"{stock.supply_zone_low:,.0f} ~ {stock.supply_zone_high:,.0f}원"
+    else:
+        zone_band_text = "산출 불가"
     return (
         "📊 [퀀트 스캔 후보]\n"
         f"{stock.star_icon} [정통 셋업] {stock.name}({stock.code}) - {sector}\n"
@@ -533,6 +824,10 @@ def build_message(stock: ScanResult) -> str:
         f"   - VCP 패턴: {stock.vcp_status}\n"
         f"   - 쿨라메기 HTF 셋업: {stock.kulamegi_htf_status}\n"
         f"   - {stock.fib_summary}\n"
+        "────────────────\n"
+        "🎯 [스나이퍼 판독]\n"
+        f"   - {stock.sniper_reading}\n"
+        f"   - 매물대 구간: {zone_band_text}\n"
         "────────────────\n"
         f"{stock.material_info}\n"
         "────────────────\n"
