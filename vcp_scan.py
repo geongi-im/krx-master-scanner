@@ -54,13 +54,21 @@ except ImportError:  # pragma: no cover - depends on local environment
 
 warnings.filterwarnings("ignore")
 
-MAX_DROP_FROM_HIGH = 0.18
+MIN_AVG_TRADED_VALUE = 5_000_000_000
+MAX_DROP_FROM_HIGH = 0.25
 MAX_PIVOT_GAP = 0.15
+MAX_BREAKOUT_EXTENSION = 0.05
 MIN_CONTRACTION_SEGMENTS = 2
-MAX_FINAL_CONTRACTION_PCT = 5.0
+MAX_FINAL_CONTRACTION_PCT = 10.0
+MAX_SEGMENT_VOLUME_RATIO = 0.90
+MIN_SEGMENT_VOLUME_DECLINE_FRACTION = 0.50
+MIN_VCP_SCORE = 55.0
+SWING_LOOKBACK_DAYS = 120
+SWING_PEAK_DISTANCE = 10
+POCKET_PIVOT_DAYS = 20
 VOLUME_DRY_UP_LOOKBACK_DAYS = 120
 VOLUME_DRY_UP_WINDOW = 10
-MIN_VOLUME_DRY_UP_RATIO = 0.70
+MIN_VOLUME_DRY_UP_RATIO = 0.35
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CHARTS_DIR = APP_DIR / "data" / "charts"
 CHART_RETENTION_DAYS = 3
@@ -87,12 +95,18 @@ def cleanup_old_chart_images(charts_dir: Path) -> int:
 class VcpCriteria:
     """VCP 스캔에 사용하는 지표 기준값입니다."""
 
-    min_avg_traded_value: int = 15_000_000_000
+    min_avg_traded_value: int = MIN_AVG_TRADED_VALUE
     max_drop_from_high: float = MAX_DROP_FROM_HIGH
     max_pivot_gap: float = MAX_PIVOT_GAP
+    max_breakout_extension: float = MAX_BREAKOUT_EXTENSION
     min_contraction_segments: int = MIN_CONTRACTION_SEGMENTS
     max_contraction_ratio: float = 1.0
     max_final_contraction_pct: float = MAX_FINAL_CONTRACTION_PCT
+    max_segment_volume_ratio: float = MAX_SEGMENT_VOLUME_RATIO
+    min_segment_volume_decline_fraction: float = MIN_SEGMENT_VOLUME_DECLINE_FRACTION
+    min_vcp_score: float = MIN_VCP_SCORE
+    swing_lookback_days: int = SWING_LOOKBACK_DAYS
+    swing_peak_distance: int = SWING_PEAK_DISTANCE
     high_window: int = 252
     recent_high_window: int = 20
     volume_dry_up_lookback_days: int = VOLUME_DRY_UP_LOOKBACK_DAYS
@@ -104,10 +118,10 @@ class VcpCriteria:
     base_ma_window: int = 200
     require_price_above_fast_ma: bool = True
     require_price_above_mid_ma: bool = True
-    require_ma_alignment: bool = True
-    pocket_pivot_days: int = 14
+    require_ma_alignment: bool = False
+    pocket_pivot_days: int = POCKET_PIVOT_DAYS
     pocket_volume_window: int = 10
-    min_pocket_pivot_count: int = 1
+    min_pocket_pivot_count: int = 0
 
 
 def runtime():
@@ -321,7 +335,12 @@ def get_clean_universe(max_symbols: int | None = None) -> pd.DataFrame:
     return clean_universe
 
 
-def calculate_swing_segments(close_prices: pd.Series) -> list[dict[str, object]]:
+def calculate_swing_segments(
+    price_data: pd.DataFrame | pd.Series,
+    *,
+    lookback_days: int = SWING_LOOKBACK_DAYS,
+    peak_distance: int = SWING_PEAK_DISTANCE,
+) -> list[dict[str, object]]:
     """최근 가격 흐름에서 고점-저점 수축 구간을 계산합니다.
 
     Args:
@@ -330,32 +349,53 @@ def calculate_swing_segments(close_prices: pd.Series) -> list[dict[str, object]]
     Returns:
         고점일, 저점일, 가격, 하락률을 담은 수축 구간 목록입니다.
     """
-    if len(close_prices) < 120:
+    if len(price_data) < lookback_days:
         return []
 
-    recent = close_prices.tail(120)
-    recent_120 = [float(value) for value in recent.values]
-    peaks = find_peaks(recent_120, distance=10)
-    troughs = find_peaks([-value for value in recent_120], distance=10)
+    if isinstance(price_data, pd.DataFrame):
+        recent = price_data.tail(lookback_days).copy()
+        close = pd.to_numeric(recent["Close"], errors="coerce")
+        high = pd.to_numeric(recent["High"], errors="coerce")
+        low = pd.to_numeric(recent["Low"], errors="coerce")
+        volume = pd.to_numeric(recent.get("Volume"), errors="coerce") if "Volume" in recent else None
+    else:
+        close = pd.to_numeric(price_data.tail(lookback_days), errors="coerce")
+        recent = close.to_frame("Close")
+        high = close
+        low = close
+        volume = None
+
+    close_values = [float(value) for value in close.values]
+    peaks = find_peaks(close_values, distance=peak_distance)
 
     segments: list[dict[str, object]] = []
-    for peak_idx in peaks:
-        later_troughs = [trough_idx for trough_idx in troughs if trough_idx > peak_idx]
-        if not later_troughs:
+    for peak_position, peak_idx in enumerate(peaks):
+        next_peak_idx = peaks[peak_position + 1] if peak_position + 1 < len(peaks) else len(recent)
+        if next_peak_idx - peak_idx < 2:
             continue
-        trough_idx = later_troughs[0]
-        peak_price = recent_120[peak_idx]
-        trough_price = recent_120[trough_idx]
-        if peak_price > 0:
-            segments.append(
-                {
-                    "peak_date": recent.index[peak_idx],
-                    "trough_date": recent.index[trough_idx],
-                    "peak_price": peak_price,
-                    "trough_price": trough_price,
-                    "drop_pct": round((peak_price - trough_price) / peak_price * 100, 2),
-                }
-            )
+
+        trough_slice = low.iloc[peak_idx + 1 : next_peak_idx]
+        if trough_slice.empty or trough_slice.isna().all():
+            continue
+        trough_date = trough_slice.idxmin()
+        trough_idx = int(recent.index.get_loc(trough_date))
+        peak_price = float(high.iloc[peak_idx])
+        trough_price = float(low.iloc[trough_idx])
+        if peak_price > 0 and trough_price < peak_price:
+            segment = {
+                "peak_date": recent.index[peak_idx],
+                "trough_date": recent.index[trough_idx],
+                "peak_price": peak_price,
+                "trough_price": trough_price,
+                "drop_pct": round((peak_price - trough_price) / peak_price * 100, 2),
+            }
+            if volume is not None:
+                segment_volume = volume.iloc[peak_idx : trough_idx + 1].dropna()
+                down_mask = close.iloc[peak_idx : trough_idx + 1].diff() < 0
+                down_volume = volume.iloc[peak_idx : trough_idx + 1][down_mask].dropna()
+                segment["avg_volume"] = float(segment_volume.mean()) if not segment_volume.empty else None
+                segment["down_volume_avg"] = float(down_volume.mean()) if not down_volume.empty else None
+            segments.append(segment)
 
     return segments
 
@@ -388,6 +428,116 @@ def classify_vcp_stage(drop_pct: float) -> str:
     return "1T early contraction"
 
 
+def format_vcp_stage(contraction_count: int, pivot_gap: float) -> str:
+    """실제 수축 횟수와 피벗 접근 상태로 VCP 표시 라벨을 만듭니다."""
+    t_count = max(1, min(int(contraction_count), 6))
+    if pivot_gap < -0.03:
+        state = "breakout"
+    elif pivot_gap <= 0.05:
+        state = "pivot-ready"
+    else:
+        state = "developing"
+    return f"{t_count}T {state}"
+
+
+def has_contracting_segment_volume(
+    swing_segments: list[dict[str, object]],
+    *,
+    min_segments: int = MIN_CONTRACTION_SEGMENTS,
+    max_final_to_first_ratio: float = MAX_SEGMENT_VOLUME_RATIO,
+    min_declining_pairs_ratio: float = MIN_SEGMENT_VOLUME_DECLINE_FRACTION,
+) -> bool:
+    """최근 가격 수축 구간에서 공급 거래량도 함께 감소하는지 확인합니다."""
+    contracting = get_recent_contracting_segments(swing_segments)
+    usable = [
+        segment
+        for segment in contracting
+        if is_finite_number(segment.get("avg_volume")) and float(segment["avg_volume"]) > 0
+    ]
+    if len(usable) < min_segments:
+        return False
+    first_volume = float(usable[0]["avg_volume"])
+    final_volume = float(usable[-1]["avg_volume"])
+    declining_pairs = sum(
+        float(current["avg_volume"]) < float(previous["avg_volume"])
+        for previous, current in zip(usable, usable[1:])
+    )
+    pair_count = len(usable) - 1
+    decline_fraction = declining_pairs / pair_count if pair_count else 0.0
+    return (
+        final_volume <= first_volume * max_final_to_first_ratio
+        and decline_fraction >= min_declining_pairs_ratio
+    )
+
+
+def calculate_vcp_score(
+    *,
+    contraction_count: int,
+    recent_swing_drops: list[float],
+    segment_volume_ratio: float,
+    volume_dry_up_ratio: float,
+    pivot_gap: float,
+    ma_alignment: bool,
+    pocket_pivot_count: int,
+) -> float:
+    """핵심 VCP 품질을 0~100점으로 요약합니다.
+
+    필수 필터를 통과한 후보끼리 구조, 마지막 수축, 공급 감소, 피벗 접근성,
+    추세 정렬 및 수급 단서를 비교하기 위한 설명 가능한 순위 점수입니다.
+    """
+    score = 0.0
+
+    score += 25.0 if contraction_count >= 3 else 18.0
+    if len(recent_swing_drops) >= 2 and recent_swing_drops[-2] > 0:
+        contraction_ratio = recent_swing_drops[-1] / recent_swing_drops[-2]
+        score += 10.0 if contraction_ratio <= 0.70 else 6.0
+
+    final_contraction = recent_swing_drops[-1]
+    if final_contraction <= 5.0:
+        score += 20.0
+    elif final_contraction <= 8.0:
+        score += 16.0
+    elif final_contraction < 10.0:
+        score += 12.0
+
+    if volume_dry_up_ratio >= 0.60:
+        score += 12.0
+    elif volume_dry_up_ratio >= 0.50:
+        score += 10.0
+    elif volume_dry_up_ratio >= 0.35:
+        score += 8.0
+
+    if segment_volume_ratio <= 0.70:
+        score += 8.0
+    elif segment_volume_ratio <= 0.90:
+        score += 5.0
+
+    absolute_pivot_gap = abs(pivot_gap)
+    if absolute_pivot_gap <= 0.03:
+        score += 15.0
+    elif absolute_pivot_gap <= 0.07:
+        score += 12.0
+    elif absolute_pivot_gap <= 0.15:
+        score += 7.0
+
+    score += 7.0 if ma_alignment else 3.0
+    if pocket_pivot_count >= 2:
+        score += 3.0
+    elif pocket_pivot_count == 1:
+        score += 2.0
+
+    return round(min(score, 100.0), 1)
+
+
+def classify_vcp_quality(score: float, contraction_count: int) -> str:
+    """점수와 수축 횟수로 차트/메시지용 품질 등급을 반환합니다."""
+    if score >= 85 and contraction_count >= 3:
+        return "A"
+    if score >= 75:
+        return "B"
+    return "C"
+
+
 def save_vcp_chart(
     df: pd.DataFrame,
     *,
@@ -397,8 +547,16 @@ def save_vcp_chart(
     drop_pct: float,
     swing_segments: list[dict[str, object]],
     pocket_pivot_points: pd.DataFrame | None = None,
+    pivot_price: float | None = None,
+    vcp_score: float | None = None,
+    quality_grade: str | None = None,
+    volume_dry_up_pct: float | None = None,
+    pivot_gap_pct: float | None = None,
     output_dir: Path,
     high_window: int = 252,
+    fast_ma_window: int = 20,
+    mid_ma_window: int = 50,
+    chart_lookback_days: int = SWING_LOOKBACK_DAYS,
 ) -> Path:
     """VCP 후보의 가격, 거래량, 수축 구간 차트를 저장합니다.
 
@@ -423,7 +581,7 @@ def save_vcp_chart(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cleanup_old_chart_images(output_dir)
-    recent = df.tail(120).copy()
+    recent = df.tail(chart_lookback_days).copy()
     recent.index = pd.to_datetime(recent.index)
     x_positions = list(range(len(recent)))
 
@@ -464,22 +622,52 @@ def save_vcp_chart(
         volume = float(row["Volume"]) / 1_000_000
         ax_volume.bar(x_pos, volume, color=color, width=body_width)
 
-    if len(recent) >= 20:
-        ax_price.plot(x_positions, recent["Close"].rolling(20).mean(), color="#2a7fb8", linewidth=1.0, alpha=0.9)
-    if len(recent) >= 60:
-        ax_price.plot(x_positions, recent["Close"].rolling(60).mean(), color="#f28e2b", linewidth=1.0, alpha=0.9)
+    if len(recent) >= fast_ma_window:
+        ax_price.plot(
+            x_positions,
+            recent["Close"].rolling(fast_ma_window).mean(),
+            color="#2a7fb8",
+            linewidth=1.1,
+            alpha=0.9,
+            label=f"MA{fast_ma_window}",
+        )
+    if len(recent) >= mid_ma_window:
+        ax_price.plot(
+            x_positions,
+            recent["Close"].rolling(mid_ma_window).mean(),
+            color="#f28e2b",
+            linewidth=1.1,
+            alpha=0.9,
+            label=f"MA{mid_ma_window}",
+        )
 
     high_52w = float(df["High"].rolling(window=high_window).max().iloc[-1])
-    ax_price.axhline(high_52w, color="#d62728", linestyle="--", linewidth=1.0, alpha=0.55)
+    ax_price.axhline(
+        high_52w,
+        color="#d62728",
+        linestyle="--",
+        linewidth=1.0,
+        alpha=0.55,
+        label=f"{high_window}D High",
+    )
+    if pivot_price is not None and is_finite_number(pivot_price):
+        ax_price.axhline(
+            float(pivot_price),
+            color="#14866d",
+            linestyle="-.",
+            linewidth=1.25,
+            alpha=0.9,
+            label=f"Pivot {float(pivot_price):,.0f}",
+        )
 
     date_to_pos = {date: idx for idx, date in enumerate(recent.index)}
     visible_segments = [
         segment
         for segment in swing_segments
         if pd.Timestamp(segment["peak_date"]) in date_to_pos and pd.Timestamp(segment["trough_date"]) in date_to_pos
-    ][-3:]
+    ][-6:]
 
-    for segment in visible_segments:
+    for contraction_no, segment in enumerate(visible_segments, start=1):
         peak_date = pd.Timestamp(segment["peak_date"])
         trough_date = pd.Timestamp(segment["trough_date"])
         peak_x = date_to_pos[peak_date]
@@ -487,14 +675,17 @@ def save_vcp_chart(
         peak_price = float(segment["peak_price"])
         trough_price = float(segment["trough_price"])
         segment_drop_pct = float(segment["drop_pct"])
+        label_x = (peak_x + trough_x) / 2
+        label_y = (peak_price + trough_price) / 2
 
         ax_price.plot([peak_x, trough_x], [peak_price, trough_price], color="#f28e2b", linewidth=1.4)
         ax_price.annotate(
-            f"-{segment_drop_pct:.1f}%",
-            xy=(trough_x, trough_price),
-            xytext=(0, -18),
+            f"T{contraction_no}  -{segment_drop_pct:.1f}%",
+            xy=(label_x, label_y),
+            xytext=(0, 12 if contraction_no % 2 == 0 else -16),
             textcoords="offset points",
             ha="center",
+            va="bottom" if contraction_no % 2 == 0 else "top",
             color="red",
             fontsize=10,
             fontweight="bold",
@@ -545,10 +736,39 @@ def save_vcp_chart(
                     linewidths=0.7,
                     zorder=5,
                 )
-            ax_price.legend(loc="upper left", fontsize=8, frameon=True)
+    ax_price.legend(loc="upper left", fontsize=8, frameon=True, ncol=2)
+
+    volume_ma = recent["Volume"].rolling(window=10, min_periods=1).mean() / 1_000_000
+    ax_volume.plot(x_positions, volume_ma, color="#6b7280", linewidth=1.0, label="Vol MA10")
+    ax_volume.legend(loc="upper left", fontsize=8, frameon=True)
 
     stage_label = vcp_stage.split()[0]
-    ax_price.set_title(f"[VCP {stage_label}] {name} ({symbol}) - 신고가까지 {drop_pct:.2f}%", fontsize=15, fontweight="bold", pad=14)
+    grade_text = f" | {quality_grade} {vcp_score:.0f}점" if quality_grade and vcp_score is not None else ""
+    ax_price.set_title(
+        f"[VCP {stage_label}{grade_text}] {name} ({symbol}) - 신고가까지 {drop_pct:.2f}%",
+        fontsize=14,
+        fontweight="bold",
+        pad=14,
+    )
+    summary_parts = []
+    if pivot_gap_pct is not None:
+        summary_parts.append(f"피벗 이격 {pivot_gap_pct:+.1f}%")
+    if volume_dry_up_pct is not None:
+        summary_parts.append(f"거래량 감소 {volume_dry_up_pct:.1f}%")
+    if visible_segments:
+        summary_parts.append(f"최종 수축 {float(visible_segments[-1]['drop_pct']):.1f}%")
+    if summary_parts:
+        ax_price.text(
+            0.99,
+            0.02,
+            "  |  ".join(summary_parts),
+            transform=ax_price.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="#263238",
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#9ca3af", "alpha": 0.88},
+        )
     ax_price.set_ylabel("Price")
     ax_price.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
     ax_volume.set_ylabel("Volume 10^6")
@@ -658,13 +878,15 @@ def validate_vcp_criteria(criteria: VcpCriteria) -> None:
         "base_ma_window": criteria.base_ma_window,
         "pocket_pivot_days": criteria.pocket_pivot_days,
         "pocket_volume_window": criteria.pocket_volume_window,
+        "swing_lookback_days": criteria.swing_lookback_days,
+        "swing_peak_distance": criteria.swing_peak_distance,
     }
     invalid_windows = [name for name, value in window_values.items() if value <= 0]
     if invalid_windows:
         raise ValueError(f"VCP 기간 기준은 1 이상이어야 합니다: {', '.join(invalid_windows)}")
     if criteria.min_avg_traded_value < 0:
         raise ValueError("VCP 최소 평균 거래대금은 0 이상이어야 합니다.")
-    if criteria.max_drop_from_high < 0 or criteria.max_pivot_gap < 0:
+    if criteria.max_drop_from_high < 0 or criteria.max_pivot_gap < 0 or criteria.max_breakout_extension < 0:
         raise ValueError("VCP 이격 기준은 0 이상이어야 합니다.")
     if criteria.min_contraction_segments < 1:
         raise ValueError("VCP 최소 수축 구간 수는 1 이상이어야 합니다.")
@@ -672,6 +894,12 @@ def validate_vcp_criteria(criteria: VcpCriteria) -> None:
         raise ValueError("VCP 수축 비율 기준은 0보다 커야 합니다.")
     if criteria.max_final_contraction_pct <= 0:
         raise ValueError("VCP 최종 수축폭 기준은 0보다 커야 합니다.")
+    if criteria.max_segment_volume_ratio <= 0:
+        raise ValueError("VCP 수축 구간 거래량 비율은 0보다 커야 합니다.")
+    if not 0 <= criteria.min_segment_volume_decline_fraction <= 1:
+        raise ValueError("VCP 수축 구간 거래량 감소 쌍 비율은 0 이상 1 이하이어야 합니다.")
+    if criteria.min_vcp_score < 0 or criteria.min_vcp_score > 100:
+        raise ValueError("VCP 최소 점수는 0 이상 100 이하이어야 합니다.")
     if criteria.min_volume_dry_up_ratio < 0 or criteria.min_volume_dry_up_ratio > 1:
         raise ValueError("VCP 거래량 감소율 기준은 0 이상 1 이하이어야 합니다.")
     if criteria.min_pocket_pivot_count < 0:
@@ -727,20 +955,53 @@ def has_contracting_swings(
     Returns:
         최소 수축 구간 수를 만족하고 최근 수축폭이 점차 작아지면 True입니다.
     """
-    if len(swing_drops) < min_segments:
+    recent = get_recent_contracting_values(swing_drops, max_segments=6)
+    if len(recent) < min_segments:
         return False
-
-    recent_count = min(len(swing_drops), max(min_segments, 3))
-    recent = swing_drops[-recent_count:]
     if recent[-1] >= max_final_contraction_pct:
         return False
 
     for previous_drop, current_drop in zip(recent, recent[1:]):
-        if current_drop >= previous_drop:
-            return False
         if current_drop > previous_drop * max_contraction_ratio:
             return False
     return True
+
+
+def get_recent_contracting_values(values: list[float], *, max_segments: int = 6) -> list[float]:
+    """가장 최근 수축부터 역으로 이어지는 감소 런을 최대 6개까지 선택합니다."""
+    clean = [float(value) for value in values if is_finite_number(value)]
+    if not clean:
+        return []
+
+    selected = [clean[-1]]
+    for value in reversed(clean[:-1]):
+        if value <= selected[0]:
+            break
+        selected.insert(0, value)
+        if len(selected) >= max_segments:
+            break
+    return selected
+
+
+def get_recent_contracting_segments(
+    swing_segments: list[dict[str, object]],
+    *,
+    max_segments: int = 6,
+) -> list[dict[str, object]]:
+    """가장 최근 가격 수축 감소 런에 대응하는 구간 목록을 반환합니다."""
+    if not swing_segments:
+        return []
+
+    selected = [swing_segments[-1]]
+    for segment in reversed(swing_segments[:-1]):
+        current_drop = float(selected[0]["drop_pct"])
+        previous_drop = float(segment["drop_pct"])
+        if previous_drop <= current_drop:
+            break
+        selected.insert(0, segment)
+        if len(selected) >= max_segments:
+            break
+    return selected
 
 
 def calculate_volume_dry_up(
@@ -828,11 +1089,16 @@ def find_pocket_pivot_points(
     """최근 기간에서 Pocket Pivot 발생일을 찾습니다."""
     pivot_df = df.copy()
     pivot_df["Prev_Close"] = pivot_df["Close"].shift(1)
-    pivot_df["Max_Volume_Window"] = pivot_df["Volume"].shift(1).rolling(window=volume_window).max()
+    down_day_volume = pivot_df["Volume"].where(pivot_df["Close"] < pivot_df["Prev_Close"])
+    pivot_df["Max_Down_Volume_Window"] = down_day_volume.shift(1).rolling(
+        window=volume_window,
+        min_periods=1,
+    ).max()
     recent_window = pivot_df.iloc[-days:]
     return recent_window[
         (recent_window["Close"] > recent_window["Prev_Close"])
-        & (recent_window["Volume"] > recent_window["Max_Volume_Window"])
+        & recent_window["Max_Down_Volume_Window"].notna()
+        & (recent_window["Volume"] > recent_window["Max_Down_Volume_Window"])
     ]
 
 
@@ -1030,9 +1296,11 @@ def generate_symbol_chart(
     high_52w = float(df["High"].rolling(window=252, min_periods=1).max().iloc[-1])
     current_price = float(df["Close"].iloc[-1])
     drop_pct = ((high_52w - current_price) / high_52w * 100) if high_52w else 0.0
-    vcp_stage = classify_vcp_stage(drop_pct)
-    swing_segments = calculate_swing_segments(df["Close"])
-    pocket_pivot_points = find_pocket_pivot_points(df, days=14, volume_window=10)
+    swing_segments = calculate_swing_segments(df)
+    swing_segments = get_recent_contracting_segments(swing_segments)
+    recent_segment_count = len(swing_segments)
+    vcp_stage = format_vcp_stage(recent_segment_count, 0.0)
+    pocket_pivot_points = find_pocket_pivot_points(df, days=POCKET_PIVOT_DAYS, volume_window=10)
 
     return save_vcp_chart(
         df,
@@ -1049,7 +1317,7 @@ def generate_symbol_chart(
 def run_vcp_engine(
     *,
     max_symbols: int | None = None,
-    min_avg_traded_value: int = 15_000_000_000,
+    min_avg_traded_value: int = MIN_AVG_TRADED_VALUE,
     max_drop_from_high: float = MAX_DROP_FROM_HIGH,
     max_pivot_gap: float = MAX_PIVOT_GAP,
     criteria: VcpCriteria | None = None,
@@ -1162,15 +1430,24 @@ def run_vcp_engine(
                 continue
 
             drop_pct = drop_from_high * 100
-            vcp_stage = classify_vcp_stage(drop_pct)
-
-            swing_segments = calculate_swing_segments(df["Close"])
+            swing_segments = calculate_swing_segments(
+                df,
+                lookback_days=criteria.swing_lookback_days,
+                peak_distance=criteria.swing_peak_distance,
+            )
             swing_drops = [float(segment["drop_pct"]) for segment in swing_segments if is_finite_number(segment["drop_pct"])]
             if not has_contracting_swings(
                 swing_drops,
                 min_segments=criteria.min_contraction_segments,
                 max_contraction_ratio=criteria.max_contraction_ratio,
                 max_final_contraction_pct=criteria.max_final_contraction_pct,
+            ):
+                continue
+            if not has_contracting_segment_volume(
+                swing_segments,
+                min_segments=criteria.min_contraction_segments,
+                max_final_to_first_ratio=criteria.max_segment_volume_ratio,
+                min_declining_pairs_ratio=criteria.min_segment_volume_decline_fraction,
             ):
                 continue
 
@@ -1187,12 +1464,19 @@ def run_vcp_engine(
             ):
                 continue
 
-            recent_high = float(df["High"].tail(criteria.recent_high_window).max())
-            if not is_finite_number(recent_high) or recent_high <= 0:
+            recent_segments = get_recent_contracting_segments(swing_segments)
+            recent_count = len(recent_segments)
+            pivot_price = max(float(segment["peak_price"]) for segment in recent_segments)
+            if not is_finite_number(pivot_price) or pivot_price <= 0:
                 continue
-            pivot_gap = (recent_high - current_price) / recent_high
-            if not is_finite_number(pivot_gap) or pivot_gap > criteria.max_pivot_gap:
+            pivot_gap = (pivot_price - current_price) / pivot_price
+            if (
+                not is_finite_number(pivot_gap)
+                or pivot_gap > criteria.max_pivot_gap
+                or pivot_gap < -criteria.max_breakout_extension
+            ):
                 continue
+            vcp_stage = format_vcp_stage(recent_count, pivot_gap)
 
             pocket_pivot_points = find_pocket_pivot_points(
                 df,
@@ -1203,9 +1487,26 @@ def run_vcp_engine(
                 continue
 
             display_name = resolve_symbol_name(str(symbol), name)
+            recent_swing_drops = [float(segment["drop_pct"]) for segment in recent_segments]
+            first_segment_volume = float(recent_segments[0]["avg_volume"])
+            final_segment_volume = float(recent_segments[-1]["avg_volume"])
+            segment_volume_ratio = final_segment_volume / first_segment_volume
             contraction_ratio = None
-            if len(swing_drops) >= 2 and swing_drops[-2] != 0:
-                contraction_ratio = swing_drops[-1] / swing_drops[-2]
+            if len(recent_swing_drops) >= 2 and recent_swing_drops[-2] != 0:
+                contraction_ratio = recent_swing_drops[-1] / recent_swing_drops[-2]
+            ma_alignment = bool(sma_mid > sma_long > sma_base)
+            vcp_score = calculate_vcp_score(
+                contraction_count=recent_count,
+                recent_swing_drops=recent_swing_drops,
+                segment_volume_ratio=segment_volume_ratio,
+                volume_dry_up_ratio=float(dry_up_ratio),
+                pivot_gap=pivot_gap,
+                ma_alignment=ma_alignment,
+                pocket_pivot_count=len(pocket_pivot_points),
+            )
+            if vcp_score < criteria.min_vcp_score:
+                continue
+            quality_grade = classify_vcp_quality(vcp_score, recent_count)
             chart_path = ""
             if save_charts and charts_dir is not None:
                 chart_path = str(
@@ -1215,10 +1516,18 @@ def run_vcp_engine(
                         symbol=symbol,
                         vcp_stage=vcp_stage,
                         drop_pct=drop_pct,
-                        swing_segments=swing_segments,
+                        swing_segments=recent_segments,
                         pocket_pivot_points=pocket_pivot_points,
+                        pivot_price=pivot_price,
+                        vcp_score=vcp_score,
+                        quality_grade=quality_grade,
+                        volume_dry_up_pct=float(dry_up_ratio) * 100,
+                        pivot_gap_pct=pivot_gap * 100,
                         output_dir=charts_dir,
                         high_window=criteria.high_window,
+                        fast_ma_window=criteria.fast_ma_window,
+                        mid_ma_window=criteria.mid_ma_window,
+                        chart_lookback_days=criteria.swing_lookback_days,
                     )
                 )
 
@@ -1229,13 +1538,24 @@ def run_vcp_engine(
                     "current_price": int(current_price),
                     "drop_from_52w_high_pct": round(drop_pct, 2),
                     "vcp_stage": vcp_stage,
-                    "recent_swing_drops_pct": swing_drops,
+                    "vcp_score": vcp_score,
+                    "quality_grade": quality_grade,
+                    "recent_swing_drops_pct": recent_swing_drops,
                     "pocket_pivot_count": len(pocket_pivot_points),
                     "pocket_pivot_count_14d": len(pocket_pivot_points),
                     "avg_traded_value_20": int(avg_traded_value_20),
                     "pivot_gap_pct": round(pivot_gap * 100, 2),
+                    "pivot_price": int(pivot_price),
+                    "contraction_count": recent_count,
+                    "segment_volume_ratios": [
+                        round(float(segment["avg_volume"]) / float(recent_segments[0]["avg_volume"]), 3)
+                        for segment in recent_segments
+                        if is_finite_number(segment.get("avg_volume")) and float(recent_segments[0]["avg_volume"]) > 0
+                    ],
+                    "final_segment_volume_ratio": round(segment_volume_ratio, 3),
+                    "ma_alignment": ma_alignment,
                     "contraction_ratio": round(contraction_ratio, 3) if contraction_ratio is not None else None,
-                    "final_contraction_pct": round(swing_drops[-1], 2) if swing_drops else None,
+                    "final_contraction_pct": round(recent_swing_drops[-1], 2),
                     "volume_dry_up_pct": round(float(dry_up_ratio) * 100, 2),
                     "volume_peak_avg": int(float(volume_dry_up["peak_avg_volume"] or 0)),
                     "recent_volume_avg": int(float(volume_dry_up["recent_avg_volume"] or 0)),
@@ -1355,7 +1675,7 @@ def save_vcp_results_to_db(
 def run_vcp_scan(
     *,
     max_symbols: int | None = None,
-    min_avg_traded_value: int = 15_000_000_000,
+    min_avg_traded_value: int = MIN_AVG_TRADED_VALUE,
     max_drop_from_high: float = MAX_DROP_FROM_HIGH,
     max_pivot_gap: float = MAX_PIVOT_GAP,
     criteria: VcpCriteria | None = None,
@@ -1402,7 +1722,11 @@ def run_vcp_scan(
         force_refresh=force_refresh,
     )
     elapsed_seconds = time.perf_counter() - started_timer
-    candidates = candidates.sort_values(by="drop_from_52w_high_pct") if not candidates.empty else candidates
+    if not candidates.empty:
+        candidates = candidates.sort_values(
+            by=["vcp_score", "contraction_count", "pivot_gap_pct"],
+            ascending=[False, False, True],
+        ).reset_index(drop=True)
 
     run_id = save_vcp_results_to_db(
         candidates,
@@ -1436,14 +1760,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-avg-traded-value",
         type=int,
-        default=15_000_000_000,
-        help="Minimum 20-day average traded value. Default: 15,000,000,000.",
+        default=MIN_AVG_TRADED_VALUE,
+        help="Minimum 20-day average traded value. Default: 5,000,000,000.",
     )
     parser.add_argument(
         "--max-drop-from-high",
         type=float,
         default=MAX_DROP_FROM_HIGH,
-        help="Maximum drop from 52-week high as a ratio. Default: 0.18.",
+        help="Maximum drop from 52-week high as a ratio. Default: 0.25.",
     )
     parser.add_argument(
         "--max-pivot-gap",
@@ -1451,9 +1775,19 @@ def parse_args() -> argparse.Namespace:
         default=MAX_PIVOT_GAP,
         help="Maximum gap from recent 20-day high as a ratio. Default: 0.15.",
     )
+    parser.add_argument("--max-breakout-extension", type=float, default=MAX_BREAKOUT_EXTENSION)
     parser.add_argument("--min-contraction-segments", type=int, default=MIN_CONTRACTION_SEGMENTS)
     parser.add_argument("--max-contraction-ratio", type=float, default=1.0)
     parser.add_argument("--max-final-contraction-pct", type=float, default=MAX_FINAL_CONTRACTION_PCT)
+    parser.add_argument("--max-segment-volume-ratio", type=float, default=MAX_SEGMENT_VOLUME_RATIO)
+    parser.add_argument(
+        "--min-segment-volume-decline-fraction",
+        type=float,
+        default=MIN_SEGMENT_VOLUME_DECLINE_FRACTION,
+    )
+    parser.add_argument("--min-vcp-score", type=float, default=MIN_VCP_SCORE)
+    parser.add_argument("--swing-lookback-days", type=int, default=SWING_LOOKBACK_DAYS)
+    parser.add_argument("--swing-peak-distance", type=int, default=SWING_PEAK_DISTANCE)
     parser.add_argument("--high-window", type=int, default=252)
     parser.add_argument("--recent-high-window", type=int, default=20)
     parser.add_argument("--volume-dry-up-lookback-days", type=int, default=VOLUME_DRY_UP_LOOKBACK_DAYS)
@@ -1465,10 +1799,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-ma-window", type=int, default=200)
     parser.add_argument("--require-price-above-fast-ma", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-price-above-mid-ma", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--require-ma-alignment", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--pocket-pivot-days", type=int, default=14)
+    parser.add_argument("--require-ma-alignment", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pocket-pivot-days", type=int, default=POCKET_PIVOT_DAYS)
     parser.add_argument("--pocket-volume-window", type=int, default=10)
-    parser.add_argument("--min-pocket-pivot-count", type=int, default=1)
+    parser.add_argument("--min-pocket-pivot-count", type=int, default=0)
     parser.add_argument(
         "--charts-dir",
         type=Path,
@@ -1507,9 +1841,15 @@ def main() -> int:
         min_avg_traded_value=args.min_avg_traded_value,
         max_drop_from_high=args.max_drop_from_high,
         max_pivot_gap=args.max_pivot_gap,
+        max_breakout_extension=args.max_breakout_extension,
         min_contraction_segments=args.min_contraction_segments,
         max_contraction_ratio=args.max_contraction_ratio,
         max_final_contraction_pct=args.max_final_contraction_pct,
+        max_segment_volume_ratio=args.max_segment_volume_ratio,
+        min_segment_volume_decline_fraction=args.min_segment_volume_decline_fraction,
+        min_vcp_score=args.min_vcp_score,
+        swing_lookback_days=args.swing_lookback_days,
+        swing_peak_distance=args.swing_peak_distance,
         high_window=args.high_window,
         recent_high_window=args.recent_high_window,
         volume_dry_up_lookback_days=args.volume_dry_up_lookback_days,

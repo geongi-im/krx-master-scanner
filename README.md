@@ -50,27 +50,47 @@ MIN_ADR=1.5
 VCP_ENABLED=true
 
 # VCP 후보 필터
-# 높이면 거래대금이 큰 종목만 남습니다.
-VCP_MIN_AVG_TRADED_VALUE=15000000000
-# 낮추면 52주 고점에 더 가까운 종목만 남습니다.
-VCP_MAX_DROP_FROM_HIGH=0.18
-# 낮추면 최근 피벗 고점에 더 가까운 종목만 남습니다.
+VCP_MIN_AVG_TRADED_VALUE=5000000000
+VCP_MAX_DROP_FROM_HIGH=0.25
 VCP_MAX_PIVOT_GAP=0.15
-# 높이면 거래량이 더 강하게 말라붙은 종목만 남습니다.
+VCP_MAX_BREAKOUT_EXTENSION=0.05
+VCP_MIN_CONTRACTION_SEGMENTS=2
+VCP_MAX_CONTRACTION_RATIO=1.0
+VCP_MAX_FINAL_CONTRACTION_PCT=10.0
+VCP_MAX_SEGMENT_VOLUME_RATIO=0.90
+VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION=0.50
+VCP_MIN_SCORE=55
+VCP_SWING_LOOKBACK_DAYS=120
+VCP_SWING_PEAK_DISTANCE=10
+VCP_HIGH_WINDOW=252
+VCP_RECENT_HIGH_WINDOW=20
+VCP_VOLUME_DRY_UP_LOOKBACK_DAYS=120
+VCP_VOLUME_DRY_UP_WINDOW=10
 VCP_MIN_VOLUME_DRY_UP_RATIO=0.35
-# 늘리면 Pocket Pivot 확인 기간이 길어집니다.
+VCP_FAST_MA_WINDOW=20
+VCP_MID_MA_WINDOW=50
+VCP_LONG_MA_WINDOW=150
+VCP_BASE_MA_WINDOW=200
+VCP_REQUIRE_PRICE_ABOVE_FAST_MA=true
+VCP_REQUIRE_PRICE_ABOVE_MID_MA=true
+VCP_REQUIRE_MA_ALIGNMENT=false
 VCP_POCKET_PIVOT_DAYS=20
+VCP_POCKET_VOLUME_WINDOW=10
+VCP_MIN_POCKET_PIVOT_COUNT=0
 ```
 
-VCP 튜닝 변수는 후보 수와 품질에 직접 영향을 주는 5개만 환경변수로 둡니다.
+VCP의 모든 하드 필터는 환경변수로 조정할 수 있습니다.
 
-- `VCP_MIN_AVG_TRADED_VALUE`: 20일 평균 거래대금 하한입니다. 높이면 유동성 큰 종목만 남습니다.
-- `VCP_MAX_DROP_FROM_HIGH`: 52주 고점 대비 허용 이격입니다. 낮추면 신고가에 더 가까운 종목만 남습니다.
-- `VCP_MAX_PIVOT_GAP`: 최근 20일 고점 대비 허용 이격입니다. 낮추면 돌파 지점에 가까운 종목만 남습니다.
-- `VCP_MIN_VOLUME_DRY_UP_RATIO`: 거래량 dry-up 하한입니다. `0.35`는 피크 대비 최근 평균 거래량이 35% 이상 줄어든 구간을 요구합니다.
-- `VCP_POCKET_PIVOT_DAYS`: Pocket Pivot을 확인할 최근 기간입니다. 기본값 `20`은 최근 20거래일 안에 1회 이상 발생한 종목을 통과시킵니다.
+- 유동성/위치: `VCP_MIN_AVG_TRADED_VALUE`, `VCP_MAX_DROP_FROM_HIGH`, `VCP_MAX_PIVOT_GAP`, `VCP_MAX_BREAKOUT_EXTENSION`
+- 수축 구조: `VCP_MIN_CONTRACTION_SEGMENTS`, `VCP_MAX_CONTRACTION_RATIO`, `VCP_MAX_FINAL_CONTRACTION_PCT`, `VCP_SWING_LOOKBACK_DAYS`, `VCP_SWING_PEAK_DISTANCE`
+- 공급 감소: `VCP_MAX_SEGMENT_VOLUME_RATIO`, `VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION`, `VCP_VOLUME_DRY_UP_LOOKBACK_DAYS`, `VCP_VOLUME_DRY_UP_WINDOW`, `VCP_MIN_VOLUME_DRY_UP_RATIO`
+- 추세: `VCP_*_MA_WINDOW`, `VCP_REQUIRE_PRICE_ABOVE_FAST_MA`, `VCP_REQUIRE_PRICE_ABOVE_MID_MA`, `VCP_REQUIRE_MA_ALIGNMENT`
+- 품질/수급: `VCP_MIN_SCORE`, `VCP_POCKET_PIVOT_DAYS`, `VCP_POCKET_VOLUME_WINDOW`, `VCP_MIN_POCKET_PIVOT_COUNT`
+- 고점 기간: `VCP_HIGH_WINDOW`, `VCP_RECENT_HIGH_WINDOW`
 
-VCP 엔진은 추가로 최근 수축폭이 단계적으로 작아지고, 최종 수축폭이 5% 미만이며, 최근 `VCP_POCKET_PIVOT_DAYS` 안에 Pocket Pivot이 1회 이상 발생한 종목을 요구합니다. 후보 차트에는 Pocket Pivot 발생일을 `PP` 마커로 표시합니다.
+기본값은 최근 KRX 데이터에서 일주일 동안 중복 제외 3개 이상, 일일 약 3~5개의 관찰 후보를 확보하도록 보정했습니다. High-Low 수축폭은 2T 이상이면서 왼쪽에서 오른쪽으로 작아져야 하고, 최종 수축은 10% 미만이어야 합니다. 마지막 수축 구간 평균 거래량은 첫 수축의 90% 이하이고 수축 간 거래량 비교의 절반 이상이 감소 방향이어야 하며, 최근 거래량은 피크 대비 35% 이상 감소해야 합니다. 52주 고점 25% 이내와 피벗 15% 이내를 허용하되 피벗 위 5%를 넘긴 종목은 추격 후보에서 제외합니다. 완전한 50/150/200일선 정렬은 희소성을 고려해 기본 하드 필터가 아니라 품질 점수에 반영합니다.
+
+후보는 0~100점 VCP 품질 점수로 정렬됩니다. 차트에는 T1~T6 수축폭, 피벗선, 52주 고점, MA20/MA50, Pocket Pivot, 거래량 MA10, 품질 등급·점수, 피벗 이격, 거래량 감소율과 최종 수축폭이 표시됩니다.
 
 ## 퀀트 스캔 스나이퍼 판독
 

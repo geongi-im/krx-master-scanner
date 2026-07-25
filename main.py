@@ -148,11 +148,35 @@ class Config:
     collect_days: int = env_int("COLLECT_DAYS", 600)
 
     vcp_enabled: bool = field(default_factory=lambda: env_bool("VCP_ENABLED", True))
-    vcp_min_avg_traded_value: int = field(default_factory=lambda: env_int("VCP_MIN_AVG_TRADED_VALUE", 15_000_000_000))
-    vcp_max_drop_from_high: float = field(default_factory=lambda: env_float("VCP_MAX_DROP_FROM_HIGH", 0.18))
+    vcp_min_avg_traded_value: int = field(default_factory=lambda: env_int("VCP_MIN_AVG_TRADED_VALUE", 5_000_000_000))
+    vcp_max_drop_from_high: float = field(default_factory=lambda: env_float("VCP_MAX_DROP_FROM_HIGH", 0.25))
     vcp_max_pivot_gap: float = field(default_factory=lambda: env_float("VCP_MAX_PIVOT_GAP", 0.15))
+    vcp_max_breakout_extension: float = field(default_factory=lambda: env_float("VCP_MAX_BREAKOUT_EXTENSION", 0.05))
+    vcp_min_contraction_segments: int = field(default_factory=lambda: env_int("VCP_MIN_CONTRACTION_SEGMENTS", 2))
+    vcp_max_contraction_ratio: float = field(default_factory=lambda: env_float("VCP_MAX_CONTRACTION_RATIO", 1.0))
+    vcp_max_final_contraction_pct: float = field(default_factory=lambda: env_float("VCP_MAX_FINAL_CONTRACTION_PCT", 10.0))
+    vcp_max_segment_volume_ratio: float = field(default_factory=lambda: env_float("VCP_MAX_SEGMENT_VOLUME_RATIO", 0.90))
+    vcp_min_segment_volume_decline_fraction: float = field(
+        default_factory=lambda: env_float("VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION", 0.50)
+    )
+    vcp_min_score: float = field(default_factory=lambda: env_float("VCP_MIN_SCORE", 55.0))
+    vcp_swing_lookback_days: int = field(default_factory=lambda: env_int("VCP_SWING_LOOKBACK_DAYS", 120))
+    vcp_swing_peak_distance: int = field(default_factory=lambda: env_int("VCP_SWING_PEAK_DISTANCE", 10))
+    vcp_high_window: int = field(default_factory=lambda: env_int("VCP_HIGH_WINDOW", 252))
+    vcp_recent_high_window: int = field(default_factory=lambda: env_int("VCP_RECENT_HIGH_WINDOW", 20))
+    vcp_volume_dry_up_lookback_days: int = field(default_factory=lambda: env_int("VCP_VOLUME_DRY_UP_LOOKBACK_DAYS", 120))
+    vcp_volume_dry_up_window: int = field(default_factory=lambda: env_int("VCP_VOLUME_DRY_UP_WINDOW", 10))
     vcp_min_volume_dry_up_ratio: float = field(default_factory=lambda: env_float("VCP_MIN_VOLUME_DRY_UP_RATIO", 0.35))
+    vcp_fast_ma_window: int = field(default_factory=lambda: env_int("VCP_FAST_MA_WINDOW", 20))
+    vcp_mid_ma_window: int = field(default_factory=lambda: env_int("VCP_MID_MA_WINDOW", 50))
+    vcp_long_ma_window: int = field(default_factory=lambda: env_int("VCP_LONG_MA_WINDOW", 150))
+    vcp_base_ma_window: int = field(default_factory=lambda: env_int("VCP_BASE_MA_WINDOW", 200))
+    vcp_require_price_above_fast_ma: bool = field(default_factory=lambda: env_bool("VCP_REQUIRE_PRICE_ABOVE_FAST_MA", True))
+    vcp_require_price_above_mid_ma: bool = field(default_factory=lambda: env_bool("VCP_REQUIRE_PRICE_ABOVE_MID_MA", True))
+    vcp_require_ma_alignment: bool = field(default_factory=lambda: env_bool("VCP_REQUIRE_MA_ALIGNMENT", False))
     vcp_pocket_pivot_days: int = field(default_factory=lambda: env_int("VCP_POCKET_PIVOT_DAYS", 20))
+    vcp_pocket_volume_window: int = field(default_factory=lambda: env_int("VCP_POCKET_VOLUME_WINDOW", 10))
+    vcp_min_pocket_pivot_count: int = field(default_factory=lambda: env_int("VCP_MIN_POCKET_PIVOT_COUNT", 0))
 
     @property
     def telegram_enabled(self) -> bool:
@@ -1228,8 +1252,13 @@ def format_vcp_message(record: pd.Series, *, rank_no: int) -> str:
     pocket_pivot_count = int(record.get("pocket_pivot_count", record.get("pocket_pivot_count_14d", 0)))
     pivot_gap_pct = record.get("pivot_gap_pct", None)
     pivot_gap_text = f"{float(pivot_gap_pct):.2f}%" if pivot_gap_pct is not None and pd.notna(pivot_gap_pct) else "-"
-    recent_high_window = int(record.get("recent_high_window", 20) or 20)
     pocket_pivot_days = int(record.get("pocket_pivot_days", 14) or 14)
+    vcp_score = float(record.get("vcp_score", 0) or 0)
+    quality_grade = str(record.get("quality_grade", "-"))
+    volume_dry_up_pct = record_float(record, "volume_dry_up_pct")
+    quality_line = f"⭐ 품질: {quality_grade}등급 / {vcp_score:.0f}점"
+    if volume_dry_up_pct is not None:
+        quality_line += f" | 거래량 감소 {volume_dry_up_pct:.1f}%"
     interpretation = format_vcp_interpretation(record)
 
     return (
@@ -1237,13 +1266,14 @@ def format_vcp_message(record: pd.Series, *, rank_no: int) -> str:
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 현재가: {current_price:,.0f}원\n"
         f"📍 52주 고점 대비: -{drop_pct:.2f}% | 단계: {record.get('vcp_stage', '-')}\n"
-        f"🎯 최근 {recent_high_window}일 고점까지: {pivot_gap_text}\n"
+        f"{quality_line}\n"
+        f"🎯 VCP 피벗까지: {pivot_gap_text}\n"
         f"💰 20일 평균 거래대금: {avg_traded_value:,.0f}원\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📊 [VCP 체크]\n"
         f"   - 최근 수축폭: {swing_text}\n"
         f"   - Pocket Pivot({pocket_pivot_days}일): {pocket_pivot_count}회\n"
-        "   - 조건: 고점권 + 수축폭 기준 + 거래대금/Pocket Pivot 통과\n"
+        "   - 조건: 고점권 + High-Low 수축/거래량 감소 + 거래대금 통과\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🧭 [해석]\n"
         f"{interpretation}"
@@ -1294,8 +1324,30 @@ def run_vcp_pipeline(config: Config, *, dry_run: bool, max_symbols: int | None, 
         min_avg_traded_value=config.vcp_min_avg_traded_value,
         max_drop_from_high=config.vcp_max_drop_from_high,
         max_pivot_gap=config.vcp_max_pivot_gap,
+        max_breakout_extension=config.vcp_max_breakout_extension,
+        min_contraction_segments=config.vcp_min_contraction_segments,
+        max_contraction_ratio=config.vcp_max_contraction_ratio,
+        max_final_contraction_pct=config.vcp_max_final_contraction_pct,
+        max_segment_volume_ratio=config.vcp_max_segment_volume_ratio,
+        min_segment_volume_decline_fraction=config.vcp_min_segment_volume_decline_fraction,
+        min_vcp_score=config.vcp_min_score,
+        swing_lookback_days=config.vcp_swing_lookback_days,
+        swing_peak_distance=config.vcp_swing_peak_distance,
+        high_window=config.vcp_high_window,
+        recent_high_window=config.vcp_recent_high_window,
+        volume_dry_up_lookback_days=config.vcp_volume_dry_up_lookback_days,
+        volume_dry_up_window=config.vcp_volume_dry_up_window,
         min_volume_dry_up_ratio=config.vcp_min_volume_dry_up_ratio,
+        fast_ma_window=config.vcp_fast_ma_window,
+        mid_ma_window=config.vcp_mid_ma_window,
+        long_ma_window=config.vcp_long_ma_window,
+        base_ma_window=config.vcp_base_ma_window,
+        require_price_above_fast_ma=config.vcp_require_price_above_fast_ma,
+        require_price_above_mid_ma=config.vcp_require_price_above_mid_ma,
+        require_ma_alignment=config.vcp_require_ma_alignment,
         pocket_pivot_days=config.vcp_pocket_pivot_days,
+        pocket_volume_window=config.vcp_pocket_volume_window,
+        min_pocket_pivot_count=config.vcp_min_pocket_pivot_count,
     )
     logger.info("VCP 스캔 시작")
 

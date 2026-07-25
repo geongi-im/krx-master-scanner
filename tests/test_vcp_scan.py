@@ -94,9 +94,85 @@ class VcpScanTest(unittest.TestCase):
         self.assertTrue(vcp_scan.has_contracting_swings([14.0, 4.5]))
         self.assertTrue(vcp_scan.has_contracting_swings([18.0, 8.0, 4.0]))
         self.assertFalse(vcp_scan.has_contracting_swings([9.0]))
-        self.assertFalse(vcp_scan.has_contracting_swings([7.0, 12.0, 4.0]))
-        self.assertFalse(vcp_scan.has_contracting_swings([18.0, 6.0, 5.0]))
+        self.assertTrue(vcp_scan.has_contracting_swings([7.0, 12.0, 4.0]))
+        self.assertTrue(vcp_scan.has_contracting_swings([18.0, 6.0, 5.0]))
+        self.assertFalse(vcp_scan.has_contracting_swings([18.0, 6.0, 5.0], max_final_contraction_pct=5.0))
         self.assertFalse(vcp_scan.has_contracting_swings([10.0, 11.0], max_contraction_ratio=1.15))
+
+    def test_calculate_swing_segments_uses_high_low_and_separate_peak_windows(self):
+        """각 고점 구간의 High-Low 수축폭과 구간 거래량을 계산하는지 검증합니다."""
+        index = pd.date_range("2026-01-01", periods=120)
+        df = pd.DataFrame(
+            {
+                "Open": [112.0] * 120,
+                "High": [113.0] * 120,
+                "Low": [111.0] * 120,
+                "Close": [112.0] * 120,
+                "Volume": [1000.0] * 120,
+            },
+            index=index,
+        )
+        df.loc[index[10], ["High", "Close"]] = [120.0, 118.0]
+        df.loc[index[15], ["Low", "Close"]] = [100.0, 102.0]
+        df.loc[index[30], ["High", "Close"]] = [115.0, 113.0]
+        df.loc[index[35], ["Low", "Close"]] = [105.0, 107.0]
+
+        with patch.object(vcp_scan, "find_peaks", return_value=[10, 30]):
+            segments = vcp_scan.calculate_swing_segments(df)
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["peak_date"], index[10])
+        self.assertEqual(segments[0]["trough_date"], index[15])
+        self.assertAlmostEqual(float(segments[0]["drop_pct"]), 16.67, places=2)
+        self.assertEqual(float(segments[0]["avg_volume"]), 1000.0)
+
+    def test_segment_volume_must_contract_with_price(self):
+        """마지막 수축 구간 거래량이 첫 구간보다 감소해야 하는지 검증합니다."""
+        declining = [
+            {"drop_pct": 15.0, "avg_volume": 1000.0},
+            {"drop_pct": 9.0, "avg_volume": 800.0},
+            {"drop_pct": 4.0, "avg_volume": 600.0},
+        ]
+        expanding = [
+            {"drop_pct": 15.0, "avg_volume": 1000.0},
+            {"drop_pct": 9.0, "avg_volume": 800.0},
+            {"drop_pct": 4.0, "avg_volume": 1100.0},
+        ]
+        insufficient_decline = [
+            {"drop_pct": 15.0, "avg_volume": 1000.0},
+            {"drop_pct": 9.0, "avg_volume": 1100.0},
+            {"drop_pct": 4.0, "avg_volume": 1200.0},
+            {"drop_pct": 2.0, "avg_volume": 850.0},
+        ]
+
+        self.assertTrue(vcp_scan.has_contracting_segment_volume(declining))
+        self.assertFalse(vcp_scan.has_contracting_segment_volume(expanding))
+        self.assertFalse(vcp_scan.has_contracting_segment_volume(insufficient_decline))
+
+    def test_vcp_score_rewards_mature_tight_structure(self):
+        """3T, 타이트한 최종 수축, 강한 거래량 감소가 더 높은 점수를 받는지 검증합니다."""
+        mature_score = vcp_scan.calculate_vcp_score(
+            contraction_count=3,
+            recent_swing_drops=[18.0, 9.0, 4.0],
+            segment_volume_ratio=0.60,
+            volume_dry_up_ratio=0.60,
+            pivot_gap=0.02,
+            ma_alignment=True,
+            pocket_pivot_count=1,
+        )
+        developing_score = vcp_scan.calculate_vcp_score(
+            contraction_count=2,
+            recent_swing_drops=[12.0, 9.0],
+            segment_volume_ratio=0.88,
+            volume_dry_up_ratio=0.36,
+            pivot_gap=0.12,
+            ma_alignment=False,
+            pocket_pivot_count=0,
+        )
+
+        self.assertGreater(mature_score, developing_score)
+        self.assertEqual(vcp_scan.classify_vcp_quality(mature_score, 3), "A")
+        self.assertEqual(vcp_scan.classify_vcp_quality(developing_score, 2), "C")
 
     def test_volume_dry_up_requires_peak_to_recent_drop_and_declining_phase(self):
         """거래량 dry-up 기준이 피크 대비 70% 이상 감소와 감소 구간을 함께 요구하는지 검증합니다."""
@@ -115,7 +191,7 @@ class VcpScanTest(unittest.TestCase):
                 "High": [11, 11, 11, 11, 11, 12],
                 "Low": [9, 9, 9, 9, 9, 9],
                 "Close": [10, 10.5, 10.2, 10.6, 10.4, 11.0],
-                "Volume": [100, 120, 110, 115, 125, 200],
+                "Volume": [100, 120, 110, 105, 125, 200],
             },
             index=pd.date_range("2026-01-01", periods=6),
         )
@@ -124,6 +200,23 @@ class VcpScanTest(unittest.TestCase):
 
         self.assertEqual(len(pivots), 1)
         self.assertEqual(pivots.index[0], pd.Timestamp("2026-01-06"))
+
+    def test_pocket_pivot_compares_only_with_prior_down_day_volume(self):
+        """Pocket Pivot 거래량 기준에서 이전 상승일 거래량은 제외하는지 검증합니다."""
+        df = pd.DataFrame(
+            {
+                "Open": [10] * 6,
+                "High": [11, 12, 11, 11, 11, 12],
+                "Low": [9] * 6,
+                "Close": [10.0, 10.8, 10.4, 10.5, 10.3, 11.0],
+                "Volume": [100, 500, 120, 130, 110, 200],
+            },
+            index=pd.date_range("2026-02-01", periods=6),
+        )
+
+        pivots = vcp_scan.find_pocket_pivot_points(df, days=1, volume_window=5)
+
+        self.assertEqual(list(pivots.index), [pd.Timestamp("2026-02-06")])
 
     def test_get_clean_universe_uses_krx_finder_fallback(self):
         """FDR KRX 목록이 실패하면 VCP 유니버스도 KRX finder fallback을 사용합니다."""
@@ -186,6 +279,8 @@ class VcpScanTest(unittest.TestCase):
                 "current_price": 15490,
                 "drop_from_52w_high_pct": 16.2,
                 "vcp_stage": "3T breakout-ready",
+                "vcp_score": 82,
+                "quality_grade": "B",
                 "recent_swing_drops_pct": [12.0, 8.0, 7.0],
                 "contraction_ratio": 0.875,
                 "pocket_pivot_count_14d": 2,
@@ -203,19 +298,39 @@ class VcpScanTest(unittest.TestCase):
         self.assertIn("하이트진로(000080)", message)
         self.assertIn("[VCP 체크]", message)
         self.assertIn("12.0% → 8.0% → 7.0%", message)
-        self.assertIn("최근 20일 고점까지: 12.30%", message)
+        self.assertIn("VCP 피벗까지: 12.30%", message)
+        self.assertIn("B등급 / 82점", message)
         self.assertIn("주의:", message)
         self.assertIn("수급:", message)
 
     def test_config_loads_vcp_environment_controls(self):
         """환경변수로 VCP 지표 기준을 제어할 수 있는지 검증합니다."""
-        original = {key: main.os.environ.get(key) for key in ("VCP_MIN_VOLUME_DRY_UP_RATIO", "VCP_POCKET_PIVOT_DAYS")}
+        keys = (
+            "VCP_MIN_VOLUME_DRY_UP_RATIO",
+            "VCP_POCKET_PIVOT_DAYS",
+            "VCP_MAX_SEGMENT_VOLUME_RATIO",
+            "VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION",
+            "VCP_MIN_SCORE",
+            "VCP_REQUIRE_MA_ALIGNMENT",
+            "VCP_SWING_PEAK_DISTANCE",
+        )
+        original = {key: main.os.environ.get(key) for key in keys}
         try:
             main.os.environ["VCP_MIN_VOLUME_DRY_UP_RATIO"] = "0.4"
             main.os.environ["VCP_POCKET_PIVOT_DAYS"] = "30"
+            main.os.environ["VCP_MAX_SEGMENT_VOLUME_RATIO"] = "0.8"
+            main.os.environ["VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION"] = "0.75"
+            main.os.environ["VCP_MIN_SCORE"] = "72"
+            main.os.environ["VCP_REQUIRE_MA_ALIGNMENT"] = "true"
+            main.os.environ["VCP_SWING_PEAK_DISTANCE"] = "8"
             config = main.Config()
             self.assertEqual(config.vcp_min_volume_dry_up_ratio, 0.4)
             self.assertEqual(config.vcp_pocket_pivot_days, 30)
+            self.assertEqual(config.vcp_max_segment_volume_ratio, 0.8)
+            self.assertEqual(config.vcp_min_segment_volume_decline_fraction, 0.75)
+            self.assertEqual(config.vcp_min_score, 72)
+            self.assertTrue(config.vcp_require_ma_alignment)
+            self.assertEqual(config.vcp_swing_peak_distance, 8)
         finally:
             for key, value in original.items():
                 if value is None:
