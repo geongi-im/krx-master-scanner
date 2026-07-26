@@ -59,13 +59,25 @@ MAX_DROP_FROM_HIGH = 0.25
 MAX_PIVOT_GAP = 0.15
 MAX_BREAKOUT_EXTENSION = 0.05
 MIN_CONTRACTION_SEGMENTS = 2
+MAX_CONTRACTION_RATIO = 1.0
 MAX_FINAL_CONTRACTION_PCT = 10.0
 MAX_SEGMENT_VOLUME_RATIO = 0.90
 MIN_SEGMENT_VOLUME_DECLINE_FRACTION = 0.50
 MIN_VCP_SCORE = 55.0
 SWING_LOOKBACK_DAYS = 120
 SWING_PEAK_DISTANCE = 10
+HIGH_WINDOW_DAYS = 252
+RECENT_HIGH_WINDOW_DAYS = 20
+FAST_MA_WINDOW = 20
+MID_MA_WINDOW = 50
+LONG_MA_WINDOW = 150
+BASE_MA_WINDOW = 200
+REQUIRE_PRICE_ABOVE_FAST_MA = True
+REQUIRE_PRICE_ABOVE_MID_MA = True
+REQUIRE_MA_ALIGNMENT = False
 POCKET_PIVOT_DAYS = 20
+POCKET_VOLUME_WINDOW = 10
+MIN_POCKET_PIVOT_COUNT = 0
 VOLUME_DRY_UP_LOOKBACK_DAYS = 120
 VOLUME_DRY_UP_WINDOW = 10
 MIN_VOLUME_DRY_UP_RATIO = 0.35
@@ -100,28 +112,28 @@ class VcpCriteria:
     max_pivot_gap: float = MAX_PIVOT_GAP
     max_breakout_extension: float = MAX_BREAKOUT_EXTENSION
     min_contraction_segments: int = MIN_CONTRACTION_SEGMENTS
-    max_contraction_ratio: float = 1.0
+    max_contraction_ratio: float = MAX_CONTRACTION_RATIO
     max_final_contraction_pct: float = MAX_FINAL_CONTRACTION_PCT
     max_segment_volume_ratio: float = MAX_SEGMENT_VOLUME_RATIO
     min_segment_volume_decline_fraction: float = MIN_SEGMENT_VOLUME_DECLINE_FRACTION
     min_vcp_score: float = MIN_VCP_SCORE
     swing_lookback_days: int = SWING_LOOKBACK_DAYS
     swing_peak_distance: int = SWING_PEAK_DISTANCE
-    high_window: int = 252
-    recent_high_window: int = 20
+    high_window: int = HIGH_WINDOW_DAYS
+    recent_high_window: int = RECENT_HIGH_WINDOW_DAYS
     volume_dry_up_lookback_days: int = VOLUME_DRY_UP_LOOKBACK_DAYS
     volume_dry_up_window: int = VOLUME_DRY_UP_WINDOW
     min_volume_dry_up_ratio: float = MIN_VOLUME_DRY_UP_RATIO
-    fast_ma_window: int = 20
-    mid_ma_window: int = 50
-    long_ma_window: int = 150
-    base_ma_window: int = 200
-    require_price_above_fast_ma: bool = True
-    require_price_above_mid_ma: bool = True
-    require_ma_alignment: bool = False
+    fast_ma_window: int = FAST_MA_WINDOW
+    mid_ma_window: int = MID_MA_WINDOW
+    long_ma_window: int = LONG_MA_WINDOW
+    base_ma_window: int = BASE_MA_WINDOW
+    require_price_above_fast_ma: bool = REQUIRE_PRICE_ABOVE_FAST_MA
+    require_price_above_mid_ma: bool = REQUIRE_PRICE_ABOVE_MID_MA
+    require_ma_alignment: bool = REQUIRE_MA_ALIGNMENT
     pocket_pivot_days: int = POCKET_PIVOT_DAYS
-    pocket_volume_window: int = 10
-    min_pocket_pivot_count: int = 0
+    pocket_volume_window: int = POCKET_VOLUME_WINDOW
+    min_pocket_pivot_count: int = MIN_POCKET_PIVOT_COUNT
 
 
 def runtime():
@@ -1775,34 +1787,14 @@ def parse_args() -> argparse.Namespace:
         default=MAX_PIVOT_GAP,
         help="Maximum gap from recent 20-day high as a ratio. Default: 0.15.",
     )
-    parser.add_argument("--max-breakout-extension", type=float, default=MAX_BREAKOUT_EXTENSION)
     parser.add_argument("--min-contraction-segments", type=int, default=MIN_CONTRACTION_SEGMENTS)
-    parser.add_argument("--max-contraction-ratio", type=float, default=1.0)
-    parser.add_argument("--max-final-contraction-pct", type=float, default=MAX_FINAL_CONTRACTION_PCT)
-    parser.add_argument("--max-segment-volume-ratio", type=float, default=MAX_SEGMENT_VOLUME_RATIO)
-    parser.add_argument(
-        "--min-segment-volume-decline-fraction",
-        type=float,
-        default=MIN_SEGMENT_VOLUME_DECLINE_FRACTION,
-    )
     parser.add_argument("--min-vcp-score", type=float, default=MIN_VCP_SCORE)
-    parser.add_argument("--swing-lookback-days", type=int, default=SWING_LOOKBACK_DAYS)
-    parser.add_argument("--swing-peak-distance", type=int, default=SWING_PEAK_DISTANCE)
-    parser.add_argument("--high-window", type=int, default=252)
-    parser.add_argument("--recent-high-window", type=int, default=20)
-    parser.add_argument("--volume-dry-up-lookback-days", type=int, default=VOLUME_DRY_UP_LOOKBACK_DAYS)
-    parser.add_argument("--volume-dry-up-window", type=int, default=VOLUME_DRY_UP_WINDOW)
     parser.add_argument("--min-volume-dry-up-ratio", type=float, default=MIN_VOLUME_DRY_UP_RATIO)
-    parser.add_argument("--fast-ma-window", type=int, default=20)
-    parser.add_argument("--mid-ma-window", type=int, default=50)
-    parser.add_argument("--long-ma-window", type=int, default=150)
-    parser.add_argument("--base-ma-window", type=int, default=200)
-    parser.add_argument("--require-price-above-fast-ma", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--require-price-above-mid-ma", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--require-ma-alignment", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--pocket-pivot-days", type=int, default=POCKET_PIVOT_DAYS)
-    parser.add_argument("--pocket-volume-window", type=int, default=10)
-    parser.add_argument("--min-pocket-pivot-count", type=int, default=0)
+    parser.add_argument(
+        "--require-ma-alignment",
+        action=argparse.BooleanOptionalAction,
+        default=REQUIRE_MA_ALIGNMENT,
+    )
     parser.add_argument(
         "--charts-dir",
         type=Path,
@@ -1841,30 +1833,10 @@ def main() -> int:
         min_avg_traded_value=args.min_avg_traded_value,
         max_drop_from_high=args.max_drop_from_high,
         max_pivot_gap=args.max_pivot_gap,
-        max_breakout_extension=args.max_breakout_extension,
         min_contraction_segments=args.min_contraction_segments,
-        max_contraction_ratio=args.max_contraction_ratio,
-        max_final_contraction_pct=args.max_final_contraction_pct,
-        max_segment_volume_ratio=args.max_segment_volume_ratio,
-        min_segment_volume_decline_fraction=args.min_segment_volume_decline_fraction,
         min_vcp_score=args.min_vcp_score,
-        swing_lookback_days=args.swing_lookback_days,
-        swing_peak_distance=args.swing_peak_distance,
-        high_window=args.high_window,
-        recent_high_window=args.recent_high_window,
-        volume_dry_up_lookback_days=args.volume_dry_up_lookback_days,
-        volume_dry_up_window=args.volume_dry_up_window,
         min_volume_dry_up_ratio=args.min_volume_dry_up_ratio,
-        fast_ma_window=args.fast_ma_window,
-        mid_ma_window=args.mid_ma_window,
-        long_ma_window=args.long_ma_window,
-        base_ma_window=args.base_ma_window,
-        require_price_above_fast_ma=args.require_price_above_fast_ma,
-        require_price_above_mid_ma=args.require_price_above_mid_ma,
         require_ma_alignment=args.require_ma_alignment,
-        pocket_pivot_days=args.pocket_pivot_days,
-        pocket_volume_window=args.pocket_volume_window,
-        min_pocket_pivot_count=args.min_pocket_pivot_count,
     )
     final_stocks, vcp_run_id, elapsed_seconds = run_vcp_scan(
         max_symbols=args.max_symbols,

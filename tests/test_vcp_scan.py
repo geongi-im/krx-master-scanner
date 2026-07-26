@@ -306,37 +306,50 @@ class VcpScanTest(unittest.TestCase):
     def test_config_loads_vcp_environment_controls(self):
         """환경변수로 VCP 지표 기준을 제어할 수 있는지 검증합니다."""
         keys = (
+            "VCP_MIN_AVG_TRADED_VALUE",
+            "VCP_MAX_DROP_FROM_HIGH",
+            "VCP_MAX_PIVOT_GAP",
+            "VCP_MIN_CONTRACTION_SEGMENTS",
             "VCP_MIN_VOLUME_DRY_UP_RATIO",
-            "VCP_POCKET_PIVOT_DAYS",
-            "VCP_MAX_SEGMENT_VOLUME_RATIO",
-            "VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION",
             "VCP_MIN_SCORE",
             "VCP_REQUIRE_MA_ALIGNMENT",
-            "VCP_SWING_PEAK_DISTANCE",
         )
         original = {key: main.os.environ.get(key) for key in keys}
         try:
+            main.os.environ["VCP_MIN_AVG_TRADED_VALUE"] = "7000000000"
+            main.os.environ["VCP_MAX_DROP_FROM_HIGH"] = "0.2"
+            main.os.environ["VCP_MAX_PIVOT_GAP"] = "0.1"
+            main.os.environ["VCP_MIN_CONTRACTION_SEGMENTS"] = "3"
             main.os.environ["VCP_MIN_VOLUME_DRY_UP_RATIO"] = "0.4"
-            main.os.environ["VCP_POCKET_PIVOT_DAYS"] = "30"
-            main.os.environ["VCP_MAX_SEGMENT_VOLUME_RATIO"] = "0.8"
-            main.os.environ["VCP_MIN_SEGMENT_VOLUME_DECLINE_FRACTION"] = "0.75"
             main.os.environ["VCP_MIN_SCORE"] = "72"
             main.os.environ["VCP_REQUIRE_MA_ALIGNMENT"] = "true"
-            main.os.environ["VCP_SWING_PEAK_DISTANCE"] = "8"
             config = main.Config()
+            self.assertEqual(config.vcp_min_avg_traded_value, 7_000_000_000)
+            self.assertEqual(config.vcp_max_drop_from_high, 0.2)
+            self.assertEqual(config.vcp_max_pivot_gap, 0.1)
+            self.assertEqual(config.vcp_min_contraction_segments, 3)
             self.assertEqual(config.vcp_min_volume_dry_up_ratio, 0.4)
-            self.assertEqual(config.vcp_pocket_pivot_days, 30)
-            self.assertEqual(config.vcp_max_segment_volume_ratio, 0.8)
-            self.assertEqual(config.vcp_min_segment_volume_decline_fraction, 0.75)
             self.assertEqual(config.vcp_min_score, 72)
             self.assertTrue(config.vcp_require_ma_alignment)
-            self.assertEqual(config.vcp_swing_peak_distance, 8)
         finally:
             for key, value in original.items():
                 if value is None:
                     main.os.environ.pop(key, None)
                 else:
                     main.os.environ[key] = value
+
+    def test_vcp_non_core_settings_use_scanner_constants(self):
+        """환경변수에서 제외한 VCP 세부 기준이 스캐너 상수를 사용하는지 검증합니다."""
+        criteria = vcp_scan.VcpCriteria()
+
+        self.assertEqual(criteria.max_breakout_extension, vcp_scan.MAX_BREAKOUT_EXTENSION)
+        self.assertEqual(criteria.max_final_contraction_pct, vcp_scan.MAX_FINAL_CONTRACTION_PCT)
+        self.assertEqual(criteria.max_segment_volume_ratio, vcp_scan.MAX_SEGMENT_VOLUME_RATIO)
+        self.assertEqual(criteria.swing_lookback_days, vcp_scan.SWING_LOOKBACK_DAYS)
+        self.assertEqual(criteria.swing_peak_distance, vcp_scan.SWING_PEAK_DISTANCE)
+        self.assertEqual(criteria.fast_ma_window, vcp_scan.FAST_MA_WINDOW)
+        self.assertEqual(criteria.base_ma_window, vcp_scan.BASE_MA_WINDOW)
+        self.assertEqual(criteria.pocket_pivot_days, vcp_scan.POCKET_PIVOT_DAYS)
 
 
 if __name__ == "__main__":
