@@ -5,6 +5,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from html import unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -14,7 +15,6 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 from matplotlib.ticker import FuncFormatter
 
 from vcp_scan import calculate_swing_segments
@@ -321,6 +321,26 @@ def generate_quant_scenario(
     return text, entry_price, target_1, stop_price
 
 
+def parse_signed_quantity(value: Any) -> int | None:
+    """네이버 수급 API 의 부호 붙은 수량 문자열을 정수로 바꿉니다.
+
+    Args:
+        value: "+659,851", "-2,707,452" 같은 문자열이나 숫자입니다.
+
+    Returns:
+        정수 값이고, 변환할 수 없으면 None 입니다.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "").replace("+", "")
+    if not text or text == "-":
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
 def get_stock_details(code: str, name: str, config: Any) -> str:
     """후보 종목의 뉴스와 수급 정보를 조회해 요약 문자열을 만듭니다.
 
@@ -339,21 +359,23 @@ def get_stock_details(code: str, name: str, config: Any) -> str:
     one_month_ago = today - timedelta(days=30)
 
     try:
-        frgn_url = f"https://finance.naver.com/item/frgn.naver?code={code}"
-        res_frgn = requests.get(frgn_url, headers=headers, timeout=config.request_timeout)
-        res_frgn.raise_for_status()
-        soup_frgn = BeautifulSoup(res_frgn.text, "html.parser")
+        trend_url = f"https://m.stock.naver.com/api/stock/{code}/trend"
+        res_trend = requests.get(trend_url, headers=headers, timeout=config.request_timeout)
+        res_trend.raise_for_status()
+        trend_rows = res_trend.json()
 
         inst_sum, frgn_sum, count = 0, 0, 0
-        for row in soup_frgn.select("table.type2 tr[onmouseout]"):
-            tds = row.select("td")
-            if len(tds) >= 7:
-                try:
-                    inst_sum += int(tds[5].text.strip().replace(",", ""))
-                    frgn_sum += int(tds[6].text.strip().replace(",", ""))
-                    count += 1
-                except ValueError:
-                    continue
+        for row in trend_rows if isinstance(trend_rows, list) else []:
+            bizdate = str(row.get("bizdate", "")).strip()
+            if len(bizdate) != 8 or bizdate > today.strftime("%Y%m%d"):
+                continue
+            inst_value = parse_signed_quantity(row.get("organPureBuyQuant"))
+            frgn_value = parse_signed_quantity(row.get("foreignerPureBuyQuant"))
+            if inst_value is None or frgn_value is None:
+                continue
+            inst_sum += inst_value
+            frgn_sum += frgn_value
+            count += 1
             if count >= 3:
                 break
 
@@ -366,20 +388,22 @@ def get_stock_details(code: str, name: str, config: Any) -> str:
 
     valid_news: list[str] = []
     try:
-        news_url = f"https://finance.naver.com/item/news_news.naver?code={code}"
+        news_url = f"https://m.stock.naver.com/api/news/stock/{code}?pageSize=20&page=1"
         res_news = requests.get(news_url, headers=headers, timeout=config.request_timeout)
         res_news.raise_for_status()
-        soup_news = BeautifulSoup(res_news.text, "html.parser")
-        for row in soup_news.select("table.type5 tbody tr"):
-            title_tag = row.select_one(".tit")
-            date_tag = row.select_one(".date")
-            if title_tag and date_tag:
+        news_groups = res_news.json()
+        for group in news_groups if isinstance(news_groups, list) else []:
+            for item in group.get("items", []):
+                raw_date = str(item.get("datetime", "")).strip()
+                raw_title = item.get("titleFull") or item.get("title") or ""
+                if not raw_date or not raw_title:
+                    continue
                 try:
-                    news_date = datetime.strptime(date_tag.text.strip(), "%Y.%m.%d %H:%M")
-                    if one_month_ago <= news_date <= today:
-                        valid_news.append(f"[네이버] {title_tag.text.strip()}")
+                    news_date = datetime.strptime(raw_date, "%Y%m%d%H%M")
                 except ValueError:
                     continue
+                if one_month_ago <= news_date <= today:
+                    valid_news.append(f"[네이버] {unescape(raw_title).strip()}")
     except Exception as exc:  # noqa: BLE001
         logger.info("네이버 뉴스 조회 실패: %s %s", code, exc)
 
