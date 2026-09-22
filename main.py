@@ -1033,29 +1033,49 @@ def fetch_ohlcv(symbol: str, start_date: str, config: Config, *, end_date: str |
     raise RuntimeError(f"OHLCV 조회 실패: {symbol}: {last_error}")
 
 
-def telegram_post(url: str, *, data: dict[str, Any], files: dict[str, Any] | None, config: Config) -> None:
-    """Telegram API에 요청을 보내고 rate limit을 재시도합니다.
+def telegram_post(
+    url: str,
+    *,
+    data: dict[str, Any],
+    files: dict[str, Any] | None,
+    config: Config,
+    timeout: int | None = None,
+) -> None:
+    """Telegram API에 요청을 보내고 rate limit과 네트워크 오류를 재시도합니다.
 
     Args:
         url: Telegram API 엔드포인트입니다.
         data: 요청 form 데이터입니다.
         files: 업로드할 파일 데이터입니다.
         config: 요청 타임아웃 설정입니다.
+        timeout: 이 요청에만 적용할 타임아웃입니다. None이면 공통 설정을 씁니다.
 
     Raises:
         RuntimeError: 재시도 후에도 Telegram 전송이 실패한 경우 발생합니다.
         requests.HTTPError: Telegram API가 오류 상태 코드를 반환한 경우 발생합니다.
     """
+    request_timeout = timeout or config.request_timeout
+    last_error = "unknown"
     for attempt in range(1, 4):
-        response = requests.post(url, data=data, files=files, timeout=config.request_timeout)
+        for file_obj in (files or {}).values():
+            if hasattr(file_obj, "seek"):
+                file_obj.seek(0)
+        try:
+            response = requests.post(url, data=data, files=files, timeout=request_timeout)
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            logger.warning("Telegram 전송 오류 재시도: attempt=%s %s", attempt, exc)
+            time.sleep(attempt * 2)
+            continue
         if response.status_code == 429:
             retry_after = response.json().get("parameters", {}).get("retry_after", 3)
             logger.warning("Telegram rate limit: retry_after=%s", retry_after)
+            last_error = response.text[:300]
             time.sleep(int(retry_after) + 1)
             continue
         response.raise_for_status()
         return
-    raise RuntimeError(f"Telegram 전송 실패: {response.text[:300]}")
+    raise RuntimeError(f"Telegram 전송 실패: {last_error}")
 
 
 def split_message(text: str, limit: int = 3900) -> list[str]:
@@ -1113,7 +1133,13 @@ def send_telegram_photo(photo_path: Path, config: Config, *, dry_run: bool = Fal
         return
     url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendPhoto"
     with photo_path.open("rb") as fp:
-        telegram_post(url, data={"chat_id": config.telegram_chat_id}, files={"photo": fp}, config=config)
+        telegram_post(
+            url,
+            data={"chat_id": config.telegram_chat_id},
+            files={"photo": fp},
+            config=config,
+            timeout=max(config.request_timeout, 60),
+        )
 
 
 def record_float(record: pd.Series, key: str) -> float | None:
@@ -1862,15 +1888,23 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
         )
         send_telegram_msg(intro_msg, config, dry_run=dry_run)
 
-        for result in found[: config.top_send_limit]:
-            chart_file = None
-            if config.send_charts and not no_charts:
-                chart_file = generate_chart(result.code, result.name, result.entry_p, result.target_p, result.stop_p, config, stock=result)
-                if chart_file:
-                    send_telegram_photo(chart_file, config, dry_run=dry_run)
-                    time.sleep(0.5)
-            send_telegram_msg(build_message(result), config, dry_run=dry_run)
+        send_targets = found[: config.top_send_limit]
+        sent_count = 0
+        for send_no, result in enumerate(send_targets, start=1):
+            try:
+                chart_file = None
+                if config.send_charts and not no_charts:
+                    chart_file = generate_chart(result.code, result.name, result.entry_p, result.target_p, result.stop_p, config, stock=result)
+                    if chart_file:
+                        send_telegram_photo(chart_file, config, dry_run=dry_run)
+                        time.sleep(0.5)
+                send_telegram_msg(build_message(result), config, dry_run=dry_run)
+                sent_count += 1
+                logger.info("브리핑 전송: %s/%s %s %s", send_no, len(send_targets), result.code, result.name)
+            except Exception:  # noqa: BLE001
+                logger.exception("브리핑 전송 실패: %s %s", result.code, result.name)
             time.sleep(0.5)
+        logger.info("브리핑 전송 완료: sent=%s/%s", sent_count, len(send_targets))
     else:
         no_result_msg = "📊 [퀀트 스캔]\n💡 조건을 만족하는 종목이 없습니다."
         send_telegram_msg(no_result_msg, config, dry_run=dry_run)
