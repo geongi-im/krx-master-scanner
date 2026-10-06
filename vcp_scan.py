@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Iterable
 
 import FinanceDataReader as fdr
+import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -65,6 +66,7 @@ MAX_SEGMENT_VOLUME_RATIO = 0.90
 MIN_SEGMENT_VOLUME_DECLINE_FRACTION = 0.50
 MIN_VCP_SCORE = 55.0
 SWING_LOOKBACK_DAYS = 120
+CHART_MIN_FETCH_DAYS = 700
 SWING_PEAK_DISTANCE = 10
 HIGH_WINDOW_DAYS = 252
 RECENT_HIGH_WINDOW_DAYS = 20
@@ -572,6 +574,9 @@ def save_vcp_chart(
 ) -> Path:
     """VCP 후보의 가격, 거래량, 수축 구간 차트를 저장합니다.
 
+    가격축은 로그 스케일이며, 이동평균은 전체 이력으로 계산한 뒤 보이는 구간만 그립니다.
+    거래량 막대는 50일 평균의 1.5배 이상인 날만 색을 입히고 나머지는 회색으로 둡니다.
+
     Args:
         df: OHLCV 데이터프레임입니다.
         name: 종목명입니다.
@@ -580,7 +585,16 @@ def save_vcp_chart(
         drop_pct: 52주 고점 대비 하락률입니다.
         swing_segments: 차트에 표시할 수축 구간 목록입니다.
         pocket_pivot_points: 차트에 표시할 Pocket Pivot 발생일 목록입니다.
+        pivot_price: 피벗 가격입니다. None이면 피벗선을 그리지 않습니다.
+        vcp_score: VCP 점수입니다. 제목의 등급 표시에 사용합니다.
+        quality_grade: VCP 품질 등급입니다.
+        volume_dry_up_pct: 호환용 인자입니다. 현재 차트에는 표시하지 않습니다.
+        pivot_gap_pct: 호환용 인자입니다. 피벗 이격은 피벗 가격과 현재가로 직접 계산합니다.
         output_dir: 차트 이미지를 저장할 디렉터리입니다.
+        high_window: 고점선 계산 기간입니다.
+        fast_ma_window: 단기 이동평균 기간입니다.
+        mid_ma_window: 중기 이동평균 기간입니다.
+        chart_lookback_days: 차트에 표시할 봉 수입니다.
 
     Returns:
         저장된 차트 이미지 파일 경로입니다.
@@ -589,87 +603,84 @@ def save_vcp_chart(
 
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cleanup_old_chart_images(output_dir)
-    recent = df.tail(chart_lookback_days).copy()
-    recent.index = pd.to_datetime(recent.index)
-    x_positions = list(range(len(recent)))
+
+    full = df.copy()
+    full.index = pd.to_datetime(full.index)
+    close = full["Close"]
+
+    ma_specs = [
+        ("EMA10", close.ewm(span=10, adjust=False).mean(), "#9ca3af", ":", 1.1),
+        (f"MA{fast_ma_window}", close.rolling(fast_ma_window).mean(), "#2f9e44", "-", 1.2),
+        (f"MA{mid_ma_window}", close.rolling(mid_ma_window).mean(), "#1d4ed8", "-", 1.2),
+        ("MA200", close.rolling(200).mean(), "#111827", "-", 1.3),
+    ]
+    volume_avg = full["Volume"].rolling(50, min_periods=10).mean()
+    high_52w = float(full["High"].rolling(window=high_window, min_periods=1).max().iloc[-1])
+
+    recent = full.tail(chart_lookback_days)
+    bar_count = len(recent)
+    x_positions = np.arange(bar_count)
 
     fig, (ax_price, ax_volume) = plt.subplots(
         2,
         1,
         sharex=True,
-        figsize=(10, 7),
-        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.04},
+        figsize=(11, 7),
+        gridspec_kw={"height_ratios": [3.2, 1], "hspace": 0.05},
     )
 
-    body_width = 0.55
-    min_body = max((recent["High"].max() - recent["Low"].min()) * 0.002, 1.0)
     up_color = "#e41f26"
     down_color = "#0047d9"
-
+    body_width = 0.6
     for x_pos, (_, row) in zip(x_positions, recent.iterrows(), strict=True):
-        open_price = float(row["Open"])
-        high_price = float(row["High"])
-        low_price = float(row["Low"])
-        close_price = float(row["Close"])
+        open_price, high_price, low_price, close_price = (float(row[key]) for key in ("Open", "High", "Low", "Close"))
         color = up_color if close_price >= open_price else down_color
-
-        ax_price.vlines(x_pos, low_price, high_price, color=color, linewidth=0.8)
-        body_low = min(open_price, close_price)
-        body_height = max(abs(close_price - open_price), min_body)
+        ax_price.vlines(x_pos, low_price, high_price, color=color, linewidth=0.8, zorder=3)
+        body_height = max(abs(close_price - open_price), close_price * 0.0015)
         ax_price.add_patch(
             Rectangle(
-                (x_pos - body_width / 2, body_low),
+                (x_pos - body_width / 2, min(open_price, close_price)),
                 body_width,
                 body_height,
                 facecolor=color,
                 edgecolor=color,
-                linewidth=0.6,
+                linewidth=0.5,
+                zorder=3,
             )
         )
 
-        volume = float(row["Volume"]) / 1_000_000
-        ax_volume.bar(x_pos, volume, color=color, width=body_width)
+    visible_ma_values = []
+    for label, series, color, line_style, line_width in ma_specs:
+        values = series.reindex(recent.index)
+        if values.notna().any():
+            visible_ma_values.append(float(values.min()))
+            ax_price.plot(
+                x_positions,
+                values.to_numpy(),
+                color=color,
+                linestyle=line_style,
+                linewidth=line_width,
+                label=label,
+                zorder=2,
+            )
 
-    if len(recent) >= fast_ma_window:
-        ax_price.plot(
-            x_positions,
-            recent["Close"].rolling(fast_ma_window).mean(),
-            color="#2a7fb8",
-            linewidth=1.1,
-            alpha=0.9,
-            label=f"MA{fast_ma_window}",
-        )
-    if len(recent) >= mid_ma_window:
-        ax_price.plot(
-            x_positions,
-            recent["Close"].rolling(mid_ma_window).mean(),
-            color="#f28e2b",
-            linewidth=1.1,
-            alpha=0.9,
-            label=f"MA{mid_ma_window}",
-        )
-
-    high_52w = float(df["High"].rolling(window=high_window).max().iloc[-1])
-    ax_price.axhline(
-        high_52w,
-        color="#d62728",
-        linestyle="--",
-        linewidth=1.0,
-        alpha=0.55,
-        label=f"{high_window}D High",
-    )
-    if pivot_price is not None and is_finite_number(pivot_price):
-        ax_price.axhline(
-            float(pivot_price),
-            color="#14866d",
-            linestyle="-.",
-            linewidth=1.25,
-            alpha=0.9,
-            label=f"Pivot {float(pivot_price):,.0f}",
+    ax_price.axhline(high_52w, color="#d62728", linestyle="--", linewidth=0.9, alpha=0.5, label=f"{high_window}D High")
+    has_pivot = pivot_price is not None and is_finite_number(pivot_price)
+    if has_pivot:
+        ax_price.axhline(float(pivot_price), color="#f08c00", linestyle="--", linewidth=1.4, alpha=0.95, label="Pivot", zorder=4)
+        ax_price.annotate(
+            f"피벗 {float(pivot_price):,.0f}",
+            xy=(0, float(pivot_price)),
+            xytext=(2, 3),
+            textcoords="offset points",
+            fontsize=8.5,
+            color="#c2410c",
+            fontweight="bold",
+            va="bottom",
         )
 
     date_to_pos = {date: idx for idx, date in enumerate(recent.index)}
@@ -678,30 +689,25 @@ def save_vcp_chart(
         for segment in swing_segments
         if pd.Timestamp(segment["peak_date"]) in date_to_pos and pd.Timestamp(segment["trough_date"]) in date_to_pos
     ][-6:]
-
     for contraction_no, segment in enumerate(visible_segments, start=1):
-        peak_date = pd.Timestamp(segment["peak_date"])
-        trough_date = pd.Timestamp(segment["trough_date"])
-        peak_x = date_to_pos[peak_date]
-        trough_x = date_to_pos[trough_date]
+        peak_x = date_to_pos[pd.Timestamp(segment["peak_date"])]
+        trough_x = date_to_pos[pd.Timestamp(segment["trough_date"])]
         peak_price = float(segment["peak_price"])
         trough_price = float(segment["trough_price"])
-        segment_drop_pct = float(segment["drop_pct"])
-        label_x = (peak_x + trough_x) / 2
-        label_y = (peak_price + trough_price) / 2
-
-        ax_price.plot([peak_x, trough_x], [peak_price, trough_price], color="#f28e2b", linewidth=1.4)
+        ax_price.plot([peak_x, trough_x], [peak_price, trough_price], color="#f28e2b", linewidth=1.5, zorder=5)
         ax_price.annotate(
-            f"T{contraction_no}  -{segment_drop_pct:.1f}%",
-            xy=(label_x, label_y),
-            xytext=(0, 12 if contraction_no % 2 == 0 else -16),
+            f"T{contraction_no} -{float(segment['drop_pct']):.1f}%",
+            xy=(peak_x, peak_price),
+            xytext=(0, 14),
             textcoords="offset points",
             ha="center",
-            va="bottom" if contraction_no % 2 == 0 else "top",
-            color="red",
-            fontsize=10,
+            va="bottom",
+            fontsize=8.5,
+            color="#b91c1c",
             fontweight="bold",
-            bbox={"boxstyle": "round,pad=0.2", "facecolor": "#fff6ba", "edgecolor": "none", "alpha": 0.85},
+            bbox={"boxstyle": "round,pad=0.2", "facecolor": "#fff6ba", "edgecolor": "none", "alpha": 0.9},
+            arrowprops={"arrowstyle": "-", "color": "#f28e2b", "linewidth": 0.8},
+            zorder=7,
         )
 
     if pocket_pivot_points is not None and not pocket_pivot_points.empty:
@@ -709,98 +715,102 @@ def save_vcp_chart(
         visible_pivots.index = pd.to_datetime(visible_pivots.index)
         visible_pivots = visible_pivots[visible_pivots.index.isin(recent.index)]
         if not visible_pivots.empty:
-            price_range = max(float(recent["High"].max() - recent["Low"].min()), 1.0)
-            ax_price.scatter([], [], marker="^", s=70, color="#6f2dbd", edgecolors="white", linewidths=0.7, label="Pocket Pivot")
-            for pivot_date, pivot_row in visible_pivots.iterrows():
-                pivot_x = date_to_pos[pd.Timestamp(pivot_date)]
-                pivot_high = float(pivot_row["High"])
-                pivot_volume = float(pivot_row["Volume"]) / 1_000_000
-                marker_y = pivot_high + price_range * 0.035
+            pivot_x = [date_to_pos[date] for date in visible_pivots.index]
+            pivot_y = (visible_pivots["Low"].astype(float) * 0.975).to_numpy()
+            ax_price.scatter(pivot_x, pivot_y, marker="^", s=26, color="#7c3aed", edgecolors="none", zorder=6, label="Pocket Pivot")
 
-                ax_price.scatter(
-                    pivot_x,
-                    marker_y,
-                    marker="^",
-                    s=70,
-                    color="#6f2dbd",
-                    edgecolors="white",
-                    linewidths=0.7,
-                    zorder=6,
-                )
-                ax_price.annotate(
-                    "PP",
-                    xy=(pivot_x, marker_y),
-                    xytext=(0, 8),
-                    textcoords="offset points",
-                    ha="center",
-                    va="bottom",
-                    color="#4c1d95",
-                    fontsize=9,
-                    fontweight="bold",
-                )
-                ax_volume.scatter(
-                    pivot_x,
-                    pivot_volume,
-                    marker="^",
-                    s=58,
-                    color="#6f2dbd",
-                    edgecolors="white",
-                    linewidths=0.7,
-                    zorder=5,
-                )
-    ax_price.legend(loc="upper left", fontsize=8, frameon=True, ncol=2)
+    low_limit = min([float(recent["Low"].min()), *visible_ma_values]) * 0.93
+    high_limit = max(float(recent["High"].max()), high_52w, float(pivot_price) if has_pivot else 0.0) * 1.07
+    last_close = float(recent["Close"].iloc[-1])
+    price_ticks: list[float] = []
+    for target in np.geomspace(low_limit, high_limit, 9):
+        magnitude = 10 ** np.floor(np.log10(target))
+        nice = min((1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10), key=lambda m: abs(m * magnitude - target)) * magnitude
+        if low_limit <= nice <= high_limit and nice not in price_ticks:
+            price_ticks.append(float(nice))
+    # 현재가 태그와 겹치는 눈금은 숨긴다.
+    price_ticks = [tick for tick in price_ticks if abs(tick / last_close - 1) > 0.03]
+    ax_price.set_yscale("log")
+    ax_price.set_ylim(low_limit, high_limit)
+    ax_price.yaxis.set_major_locator(FixedLocator(price_ticks))
+    ax_price.yaxis.set_minor_locator(NullLocator())
+    ax_price.yaxis.set_minor_formatter(NullFormatter())
+    ax_price.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
 
-    volume_ma = recent["Volume"].rolling(window=10, min_periods=1).mean() / 1_000_000
-    ax_volume.plot(x_positions, volume_ma, color="#6b7280", linewidth=1.0, label="Vol MA10")
-    ax_volume.legend(loc="upper left", fontsize=8, frameon=True)
+    for axis in (ax_price, ax_volume):
+        axis.yaxis.tick_right()
+        axis.yaxis.set_label_position("right")
+        axis.grid(True, linestyle=":", linewidth=0.7, alpha=0.7)
+        axis.set_axisbelow(True)
+        for side in ("top", "left"):
+            axis.spines[side].set_visible(False)
+
+    last_row = recent.iloc[-1]
+    last_color = up_color if last_close >= float(last_row["Open"]) else down_color
+    ax_price.axhline(last_close, color=last_color, linewidth=0.6, alpha=0.5, linestyle=":")
+    ax_price.annotate(
+        f"{last_close:,.0f}",
+        xy=(1, last_close),
+        xycoords=("axes fraction", "data"),
+        xytext=(3, 0),
+        textcoords="offset points",
+        va="center",
+        ha="left",
+        fontsize=8.5,
+        color="white",
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": last_color, "edgecolor": "none"},
+        zorder=10,
+    )
+
+    volume = recent["Volume"].astype(float)
+    volume_avg_recent = volume_avg.reindex(recent.index)
+    is_up = recent["Close"] >= recent["Open"]
+    is_spike = volume >= volume_avg_recent * 1.5
+    bar_colors = np.where(is_spike, np.where(is_up, up_color, down_color), "#c7ccd4")
+    ax_volume.bar(x_positions, volume / 1_000_000, width=body_width, color=bar_colors)
+    ax_volume.plot(x_positions, (volume_avg_recent / 1_000_000).to_numpy(), color="#6b7280", linewidth=1.0, label="Vol MA50")
+    ax_volume.set_ylabel("Vol (백만)", fontsize=8)
+    ax_volume.legend(loc="upper left", fontsize=7.5, frameon=True, framealpha=0.85, edgecolor="none")
+
+    handles, labels = ax_price.get_legend_handles_labels()
+    ax_price.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=len(labels),
+        fontsize=8,
+        frameon=False,
+        handlelength=1.8,
+        columnspacing=1.2,
+    )
 
     stage_label = vcp_stage.split()[0]
     grade_text = f" | {quality_grade} {vcp_score:.0f}점" if quality_grade and vcp_score is not None else ""
-    ax_price.set_title(
-        f"[VCP {stage_label}{grade_text}] {name} ({symbol}) - 신고가까지 {drop_pct:.2f}%",
+    summary = f"현재가 {last_close:,.0f}  |  신고가까지 {drop_pct:.1f}%"
+    if has_pivot:
+        summary += f"  |  피벗까지 {(float(pivot_price) - last_close) / float(pivot_price) * 100:+.1f}%"
+    fig.suptitle(
+        f"[VCP {stage_label}{grade_text}] {name} ({symbol})",
+        x=0.04,
+        y=0.99,
+        ha="left",
+        va="top",
         fontsize=14,
         fontweight="bold",
-        pad=14,
     )
-    summary_parts = []
-    if pivot_gap_pct is not None:
-        summary_parts.append(f"피벗 이격 {pivot_gap_pct:+.1f}%")
-    if volume_dry_up_pct is not None:
-        summary_parts.append(f"거래량 감소 {volume_dry_up_pct:.1f}%")
-    if visible_segments:
-        summary_parts.append(f"최종 수축 {float(visible_segments[-1]['drop_pct']):.1f}%")
-    if summary_parts:
-        ax_price.text(
-            0.99,
-            0.02,
-            "  |  ".join(summary_parts),
-            transform=ax_price.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=9,
-            color="#263238",
-            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#9ca3af", "alpha": 0.88},
-        )
-    ax_price.set_ylabel("Price")
-    ax_price.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
-    ax_volume.set_ylabel("Volume 10^6")
+    fig.text(0.04, 0.935, summary, ha="left", fontsize=11, color="black", fontweight="bold")
 
-    for axis in (ax_price, ax_volume):
-        axis.grid(True, linestyle=":", linewidth=0.8, alpha=0.75)
-        axis.set_axisbelow(True)
+    tick_step = max(1, bar_count // 8)
+    ticks = list(range(0, bar_count, tick_step))
+    ax_volume.set_xticks(ticks)
+    ax_volume.set_xticklabels([recent.index[idx].strftime("%y.%m.%d") for idx in ticks], fontsize=8)
+    ax_volume.set_xlim(-1, bar_count + 1)
 
-    tick_count = min(6, len(recent))
-    if tick_count:
-        tick_step = max(1, len(recent) // tick_count)
-        ticks = list(range(0, len(recent), tick_step))
-        if ticks[-1] != len(recent) - 1:
-            ticks.append(len(recent) - 1)
-        ax_volume.set_xticks(ticks)
-        ax_volume.set_xticklabels([recent.index[idx].strftime("%y.%m.%d") for idx in ticks], rotation=45, ha="right")
-
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.04, right=0.91, top=0.86, bottom=0.07)
     output_path = output_dir / f"chart_{safe_filename(name)}_{symbol}.png"
-    fig.savefig(output_path, dpi=140, bbox_inches="tight")
+    fig.savefig(output_path, dpi=140)
     plt.close(fig)
     return output_path
 
@@ -1293,7 +1303,8 @@ def generate_symbol_chart(
         ValueError: 차트 생성에 필요한 OHLCV 데이터가 부족한 경우 발생합니다.
     """
     end_date = resolve_target_datetime(target_date)
-    start_date = end_date - timedelta(days=days)
+    # MA200 이 차트 왼쪽 끝부터 그려지도록 최소 CHART_MIN_FETCH_DAYS 일을 조회한다.
+    start_date = end_date - timedelta(days=max(days, CHART_MIN_FETCH_DAYS))
     df = fetch_ohlcv_data(
         symbol,
         start_date=start_date,
@@ -1313,6 +1324,7 @@ def generate_symbol_chart(
     recent_segment_count = len(swing_segments)
     vcp_stage = format_vcp_stage(recent_segment_count, 0.0)
     pocket_pivot_points = find_pocket_pivot_points(df, days=POCKET_PIVOT_DAYS, volume_window=10)
+    pivot_price = max((float(segment["peak_price"]) for segment in swing_segments), default=None)
 
     return save_vcp_chart(
         df,
@@ -1322,6 +1334,7 @@ def generate_symbol_chart(
         drop_pct=drop_pct,
         swing_segments=swing_segments,
         pocket_pivot_points=pocket_pivot_points,
+        pivot_price=pivot_price,
         output_dir=charts_dir,
     )
 
