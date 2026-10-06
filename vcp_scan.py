@@ -244,15 +244,51 @@ def find_peaks(values: list[float], distance: int = 1) -> list[int]:
     return peaks
 
 
+def find_linux_korean_font() -> str | None:
+    """Linux 에서 사용할 수 있는 한글 폰트를 찾아 matplotlib 에 등록합니다.
+
+    matplotlib 폰트 캐시는 폰트를 설치한 뒤에도 갱신되지 않아 이전 캐시를 계속 쓴다.
+    그래서 캐시를 거치지 않고 폰트 파일을 직접 찾아 addfont 로 등록한다.
+
+    Returns:
+        등록한 폰트 family 이름입니다. 찾지 못하면 None 입니다.
+    """
+    import matplotlib.font_manager as fm
+
+    candidates = [APP_DIR / "assets" / "NanumGothic-Regular.ttf"]
+    candidates.extend(
+        Path(path) for path in sorted(fm.findSystemFonts(fontext="ttf")) if "nanumgothic" in Path(path).name.lower()
+    )
+    candidates.extend(
+        Path(path) for path in sorted(fm.findSystemFonts(fontext="ttf")) if "notosanscjk" in Path(path).name.lower()
+    )
+
+    family_name = None
+    for font_path in candidates:
+        if not font_path.exists():
+            continue
+        fm.fontManager.addfont(str(font_path))
+        if family_name is None:
+            family_name = fm.FontProperties(fname=str(font_path)).get_name()
+    return family_name
+
+
 def setup_chart_style() -> None:
     """VCP 차트 생성을 위한 matplotlib 스타일과 한글 폰트를 설정합니다."""
     import matplotlib as mpl
 
     mpl.use("Agg")
-    if platform.system() == "Windows":
+    system = platform.system()
+    if system == "Windows":
         mpl.rcParams["font.family"] = "Malgun Gothic"
-    elif platform.system() == "Darwin":
+    elif system == "Darwin":
         mpl.rcParams["font.family"] = "AppleGothic"
+    else:
+        font_family = find_linux_korean_font()
+        if font_family is not None:
+            mpl.rcParams["font.family"] = font_family
+        else:
+            warnings.warn("한글 폰트를 찾지 못했습니다. 'sudo apt install fonts-nanum' 후 다시 실행하세요.", stacklevel=2)
     mpl.rcParams["axes.unicode_minus"] = False
 
 
