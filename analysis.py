@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -17,9 +16,10 @@ import pandas as pd
 import requests
 from matplotlib.ticker import FuncFormatter
 
+from utils.logger_util import LoggerUtil
 from vcp_scan import calculate_swing_segments
 
-logger = logging.getLogger("krx-master-scanner")
+logger = LoggerUtil().get_logger()
 
 SUPPLY_ZONE_LOOKBACK_DAYS = 120
 SUPPLY_ZONE_BINS = 24

@@ -11,9 +11,9 @@ KRX Master Scanner
 from __future__ import annotations
 
 import argparse
+import html
 import io
 import json
-import logging
 import os
 import platform
 import re
@@ -41,6 +41,8 @@ from dotenv import load_dotenv
 import db_scheme
 from analysis import ScanResult, analyze_stock, build_message, check_market_regime, generate_chart, get_stock_details
 from utils.holiday_util import HolidayUtil
+from utils.logger_util import LoggerUtil
+from utils.telegram_util import TelegramUtil
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -209,26 +211,7 @@ def format_target_date(config: Config) -> str:
     return f"{target.year}년 {target.month}월 {target.day}일({weekday_names[target.weekday()]})"
 
 
-def setup_logging() -> logging.Logger:
-    """파일과 콘솔에 기록하는 애플리케이션 로거를 설정합니다.
-
-    Returns:
-        KRX 마스터 스캐너에서 사용할 로거입니다.
-    """
-    now = datetime.now(KST).strftime("%Y-%m-%d")
-    log_file = LOG_DIR / f"{now}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    return logging.getLogger("krx-master-scanner")
-
-
-logger = setup_logging()
+logger = LoggerUtil().get_logger()
 
 
 def cleanup_old_chart_images(charts_dir: Path, *, now_ts: float | None = None) -> int:
@@ -1037,51 +1020,6 @@ def fetch_ohlcv(symbol: str, start_date: str, config: Config, *, end_date: str |
     raise RuntimeError(f"OHLCV 조회 실패: {symbol}: {last_error}")
 
 
-def telegram_post(
-    url: str,
-    *,
-    data: dict[str, Any],
-    files: dict[str, Any] | None,
-    config: Config,
-    timeout: int | None = None,
-) -> None:
-    """Telegram API에 요청을 보내고 rate limit과 네트워크 오류를 재시도합니다.
-
-    Args:
-        url: Telegram API 엔드포인트입니다.
-        data: 요청 form 데이터입니다.
-        files: 업로드할 파일 데이터입니다.
-        config: 요청 타임아웃 설정입니다.
-        timeout: 이 요청에만 적용할 타임아웃입니다. None이면 공통 설정을 씁니다.
-
-    Raises:
-        RuntimeError: 재시도 후에도 Telegram 전송이 실패한 경우 발생합니다.
-        requests.HTTPError: Telegram API가 오류 상태 코드를 반환한 경우 발생합니다.
-    """
-    request_timeout = timeout or config.request_timeout
-    last_error = "unknown"
-    for attempt in range(1, 4):
-        for file_obj in (files or {}).values():
-            if hasattr(file_obj, "seek"):
-                file_obj.seek(0)
-        try:
-            response = requests.post(url, data=data, files=files, timeout=request_timeout)
-        except requests.RequestException as exc:
-            last_error = str(exc)
-            logger.warning("Telegram 전송 오류 재시도: attempt=%s %s", attempt, exc)
-            time.sleep(attempt * 2)
-            continue
-        if response.status_code == 429:
-            retry_after = response.json().get("parameters", {}).get("retry_after", 3)
-            logger.warning("Telegram rate limit: retry_after=%s", retry_after)
-            last_error = response.text[:300]
-            time.sleep(int(retry_after) + 1)
-            continue
-        response.raise_for_status()
-        return
-    raise RuntimeError(f"Telegram 전송 실패: {last_error}")
-
-
 def split_message(text: str, limit: int = 3900) -> list[str]:
     """Telegram 메시지 길이 제한에 맞게 본문을 나눕니다.
 
@@ -1108,19 +1046,21 @@ def split_message(text: str, limit: int = 3900) -> list[str]:
 
 
 def send_telegram_msg(text: str, config: Config, *, dry_run: bool = False) -> None:
-    """텍스트 메시지를 Telegram으로 전송합니다.
+    """텍스트 메시지를 Telegram 으로 전송합니다.
+
+    TelegramUtil 은 parse_mode=html 로 보내므로 본문의 < > & 가 전송을 거부시키지 않도록 이스케이프합니다.
 
     Args:
         text: 전송할 메시지입니다.
-        config: Telegram 토큰과 채팅 ID를 포함한 설정입니다.
+        config: Telegram 토큰과 채팅 ID 설정 여부를 포함한 설정입니다.
         dry_run: 실제 전송 대신 로그만 남길지 여부입니다.
     """
     if dry_run or not config.telegram_enabled:
         logger.info("Telegram 메시지 스킵(dry_run=%s enabled=%s): %s", dry_run, config.telegram_enabled, text[:120])
         return
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    telegram = TelegramUtil()
     for chunk in split_message(text):
-        telegram_post(url, data={"chat_id": config.telegram_chat_id, "text": chunk}, files=None, config=config)
+        telegram.send_message(html.escape(chunk, quote=False))
         time.sleep(0.4)
 
 
@@ -1129,39 +1069,36 @@ def send_telegram_test_msg(text: str, config: Config, *, dry_run: bool = False) 
 
     Args:
         text: 전송할 메시지입니다.
-        config: Telegram 토큰과 테스트 채팅 ID를 포함한 설정입니다.
+        config: Telegram 토큰과 테스트 채팅 ID 설정 여부를 포함한 설정입니다.
         dry_run: 실제 전송 대신 로그만 남길지 여부입니다.
     """
     test_enabled = config.telegram_enabled and bool(config.telegram_chat_test_id)
     if dry_run or not test_enabled:
         logger.info("Telegram 테스트방 메시지 스킵(dry_run=%s enabled=%s): %s", dry_run, test_enabled, text[:120])
         return
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    telegram = TelegramUtil()
     for chunk in split_message(text):
-        telegram_post(url, data={"chat_id": config.telegram_chat_test_id, "text": chunk}, files=None, config=config)
+        telegram.send_test_message(html.escape(chunk, quote=False))
         time.sleep(0.4)
 
 
 def send_telegram_photo(photo_path: Path, config: Config, *, dry_run: bool = False) -> None:
-    """차트 이미지 파일을 Telegram으로 전송합니다.
+    """차트 이미지 파일을 Telegram 으로 전송합니다.
 
     Args:
         photo_path: 전송할 이미지 파일 경로입니다.
-        config: Telegram 토큰과 채팅 ID를 포함한 설정입니다.
+        config: Telegram 토큰과 채팅 ID 설정 여부를 포함한 설정입니다.
         dry_run: 실제 전송 대신 로그만 남길지 여부입니다.
+
+    Raises:
+        RuntimeError: Telegram 이 사진 전송을 거부한 경우 발생합니다.
     """
     if dry_run or not config.telegram_enabled:
         logger.info("Telegram 사진 스킵(dry_run=%s enabled=%s): %s", dry_run, config.telegram_enabled, photo_path)
         return
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendPhoto"
-    with photo_path.open("rb") as fp:
-        telegram_post(
-            url,
-            data={"chat_id": config.telegram_chat_id},
-            files={"photo": fp},
-            config=config,
-            timeout=max(config.request_timeout, 60),
-        )
+    response = TelegramUtil().send_photo(str(photo_path))
+    if not response.get("ok"):
+        raise RuntimeError(f"Telegram 사진 전송 실패: {str(response)[:300]}")
 
 
 def record_float(record: pd.Series, key: str) -> float | None:
