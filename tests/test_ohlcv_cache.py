@@ -6,6 +6,23 @@ from unittest.mock import patch
 import pandas as pd
 
 import main
+from utils.holiday_util import HolidayDataError, HolidayUtil
+
+
+class FakeHolidayUtil(HolidayUtil):
+    """DB 없이 지정한 휴장일만 돌려주는 테스트용 휴장일 유틸입니다."""
+
+    def __init__(self, holidays: dict | None = None, error: Exception | None = None) -> None:
+        super().__init__()
+        self._holidays = holidays or {}
+        self._error = error
+
+    def _query_year(self, year: int):
+        if self._error:
+            raise self._error
+        # 연도 데이터가 비면 오류가 나므로 연도마다 더미 휴장일을 하나 넣는다.
+        rows = [(day, name) for day, name in self._holidays.items() if day.year == year]
+        return rows or [(date(year, 1, 1), "신정")]
 
 
 class OhlcvCacheTest(unittest.TestCase):
@@ -304,10 +321,37 @@ class OhlcvCacheTest(unittest.TestCase):
 
     def test_expected_latest_trade_date_handles_weekend_and_intraday_runs(self):
         """기대 최신 거래일이 주말과 장중 실행 시각을 고려하는지 검증합니다."""
-        self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 20, 10, 0)), date(2026, 6, 19))
-        self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 19, 10, 0)), date(2026, 6, 18))
-        self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 19, 20, 0)), date(2026, 6, 19))
-        self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 22, 10, 0)), date(2026, 6, 19))
+        with patch.object(main, "HOLIDAY_UTIL", FakeHolidayUtil()):
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 20, 10, 0)), date(2026, 6, 19))
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 19, 10, 0)), date(2026, 6, 18))
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 19, 20, 0)), date(2026, 6, 19))
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 22, 10, 0)), date(2026, 6, 19))
+
+    def test_expected_latest_trade_date_skips_krx_holidays(self):
+        """휴장일은 기대 최신 거래일에서 건너뛰는지 검증합니다."""
+        util = FakeHolidayUtil({date(2026, 6, 3): "지방선거"})
+        with patch.object(main, "HOLIDAY_UTIL", util):
+            # 휴장일 저녁과 휴장일 다음날 오전은 모두 직전 거래일(6/2)이다.
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 3, 20, 0)), date(2026, 6, 2))
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 4, 10, 0)), date(2026, 6, 2))
+            self.assertEqual(main.expected_latest_trade_date(datetime(2026, 6, 4, 20, 0)), date(2026, 6, 4))
+
+    def test_run_sends_telegram_and_stops_when_holiday_data_is_missing(self):
+        """휴장일 데이터를 못 읽으면 텔레그램으로 알리고 수집 없이 중단하는지 검증합니다."""
+        config = main.Config(max_workers=1)
+
+        with (
+            patch.object(main, "setup_korean_font"),
+            patch.object(main, "HOLIDAY_UTIL", FakeHolidayUtil(error=HolidayDataError("2026년 휴장일 데이터가 없습니다."))),
+            patch.object(main, "collect_ohlcv_data") as collect,
+            patch.object(main, "send_telegram_test_msg") as send_msg,
+        ):
+            exit_code = main.run(config, dry_run=False, max_symbols=None, no_charts=True)
+
+        self.assertEqual(exit_code, 1)
+        collect.assert_not_called()
+        send_msg.assert_called_once()
+        self.assertIn("휴장일", send_msg.call_args.args[0])
 
     def test_collect_ohlcv_data_fetches_index_and_full_collection_universe(self):
         """전체 수집 단계가 KQ11과 수집 유니버스 전체 종목을 조회하는지 검증합니다."""
@@ -397,6 +441,7 @@ class OhlcvCacheTest(unittest.TestCase):
 
         with (
             patch.object(main, "setup_korean_font"),
+            patch.object(main, "HOLIDAY_UTIL", FakeHolidayUtil()),
             patch.object(main, "collect_ohlcv_data", return_value=main.Counter({"targets_total": 3})) as collect,
             patch.object(main, "check_market_regime", return_value=regime),
             patch.object(main, "load_universe", return_value=empty_universe) as load_universe,
@@ -419,6 +464,7 @@ class OhlcvCacheTest(unittest.TestCase):
 
         with (
             patch.object(main, "setup_korean_font"),
+            patch.object(main, "HOLIDAY_UTIL", FakeHolidayUtil()),
             patch.object(main, "collect_ohlcv_data", return_value=main.Counter()),
             patch.object(main, "check_market_regime", return_value=regime),
             patch.object(main, "load_universe", return_value=empty_universe),

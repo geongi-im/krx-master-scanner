@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 
 import db_scheme
 from analysis import ScanResult, analyze_stock, build_message, check_market_regime, generate_chart, get_stock_details
+from utils.holiday_util import HolidayUtil
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -67,6 +68,9 @@ for directory in (DATA_DIR, CHART_DIR, LOG_DIR, ASSET_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(APP_DIR / ".env")
+
+# 연도별 휴장일을 한 번만 읽도록 프로세스 전체에서 하나만 쓴다.
+HOLIDAY_UTIL = HolidayUtil()
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -121,6 +125,7 @@ def env_float(name: str, default: float) -> float:
 class Config:
     telegram_bot_token: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str | None = os.getenv("TELEGRAM_CHAT_ID")
+    telegram_chat_test_id: str | None = os.getenv("TELEGRAM_CHAT_TEST_ID")
 
     max_workers: int = env_int("MAX_WORKERS", 4)
     cache_ttl_hours: int = env_int("CACHE_TTL_HOURS", 18)
@@ -844,19 +849,18 @@ def expected_latest_trade_date(now: datetime | None = None) -> date:
         now: 계산 기준 시각입니다. None이면 현재 KST 시각을 사용합니다.
 
     Returns:
-        주말과 장중 실행을 고려한 기대 최신 거래일입니다.
+        주말, KRX 휴장일, 장중 실행을 고려한 기대 최신 거래일입니다.
+
+    Raises:
+        HolidayDataError: 휴장일 데이터가 없을 때 발생합니다.
+        pymysql.MySQLError: 휴장일 DB 조회에 실패했을 때 발생합니다.
     """
     current = now or datetime.now(KST)
-    candidate = current.date()
+    today = current.date()
 
-    if current.weekday() >= 5:
-        candidate -= timedelta(days=current.weekday() - 4)
-    elif current.hour < 18:
-        candidate -= timedelta(days=1)
-        while candidate.weekday() >= 5:
-            candidate -= timedelta(days=1)
-
-    return candidate
+    if current.hour >= 18 and HOLIDAY_UTIL.is_trading_day(today):
+        return today
+    return HOLIDAY_UTIL.get_previous_trading_day(today)
 
 
 def cache_is_fresh(symbol: str, config: Config, *, end_date: str | None = None) -> bool:
@@ -1117,6 +1121,24 @@ def send_telegram_msg(text: str, config: Config, *, dry_run: bool = False) -> No
     url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
     for chunk in split_message(text):
         telegram_post(url, data={"chat_id": config.telegram_chat_id, "text": chunk}, files=None, config=config)
+        time.sleep(0.4)
+
+
+def send_telegram_test_msg(text: str, config: Config, *, dry_run: bool = False) -> None:
+    """오류 알림용 테스트 채팅방(TELEGRAM_CHAT_TEST_ID)으로 텍스트 메시지를 전송합니다.
+
+    Args:
+        text: 전송할 메시지입니다.
+        config: Telegram 토큰과 테스트 채팅 ID를 포함한 설정입니다.
+        dry_run: 실제 전송 대신 로그만 남길지 여부입니다.
+    """
+    test_enabled = config.telegram_enabled and bool(config.telegram_chat_test_id)
+    if dry_run or not test_enabled:
+        logger.info("Telegram 테스트방 메시지 스킵(dry_run=%s enabled=%s): %s", dry_run, test_enabled, text[:120])
+        return
+    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    for chunk in split_message(text):
+        telegram_post(url, data={"chat_id": config.telegram_chat_test_id, "text": chunk}, files=None, config=config)
         time.sleep(0.4)
 
 
@@ -1827,6 +1849,17 @@ def run(config: Config, *, dry_run: bool, max_symbols: int | None, no_charts: bo
     reference_dt = config_target_datetime(config)
     now_display = reference_dt.strftime("%Y-%m-%d %H:%M:%S")
     logger.info("마스터 스캐너 시작: %s 기준일=%s", now_display, config.target_date or "-")
+
+    # 휴장일을 못 읽으면 거래일 기준이 틀어지므로 수집 전에 텔레그램으로 알리고 중단한다.
+    try:
+        expected_latest_trade_date(reference_dt)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("휴장일 조회 실패, 실행 중단")
+        try:
+            send_telegram_test_msg(f"⚠️ [스캐너 중단]\n휴장일 데이터를 읽지 못했습니다.\n{type(exc).__name__}: {exc}", config, dry_run=dry_run)
+        except Exception:  # noqa: BLE001
+            logger.exception("휴장일 오류 텔레그램 전송 실패")
+        return 1
 
     stats: Counter = Counter()
     collection_stats = collect_ohlcv_data(config)
