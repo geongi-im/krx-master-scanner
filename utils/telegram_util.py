@@ -53,8 +53,8 @@ class TelegramUtil:
                         timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
                     )
             except (requests.ConnectionError, requests.Timeout) as e:
-                last_error = e
-                logger.warning("Telegram %s 네트워크 오류(%s/%s): %s", method, attempt, MAX_ATTEMPTS, e)
+                last_error = self._mask_token(e)
+                logger.warning("Telegram %s 네트워크 오류(%s/%s): %s", method, attempt, MAX_ATTEMPTS, last_error)
             else:
                 result = self._parse_response(response)
                 if result.get("ok") or response.status_code not in RETRYABLE_STATUS_CODES:
@@ -72,7 +72,15 @@ class TelegramUtil:
             if attempt < MAX_ATTEMPTS:
                 time.sleep(wait_seconds)
 
-        raise TelegramSendError(f"Telegram {method} 전송 실패: {last_error}") from last_error
+        # 원래 예외를 체인으로 달면 traceback 에 토큰이 든 URL 이 그대로 찍힌다
+        raise TelegramSendError(f"Telegram {method} 전송 실패: {last_error}") from None
+
+    def _mask_token(self, error):
+        """requests 예외 메시지에는 /bot<토큰>/ 이 든 URL 이 들어가므로 토큰을 가린다"""
+        text = f"{type(error).__name__}: {error}"
+        if self.bot_token:
+            text = text.replace(self.bot_token, "***")
+        return text
 
     @staticmethod
     def _parse_response(response):
